@@ -17,7 +17,7 @@ shimmy==2.0.0
 supersuit==3.9.3
 
 # For tests on minigrid.
-minigrid==2.3.1
+minigrid==3.1.0
 tensorflow_estimator
 
 # DeepMind's OpenSpiel
