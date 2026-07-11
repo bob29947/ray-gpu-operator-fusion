@@ -7,6 +7,7 @@ from .configure_map_task_memory import (
     ConfigureMapTaskMemoryUsingOutputSize,
 )
 from .inherit_target_max_block_size import InheritTargetMaxBlockSizeRule
+from .gpu_operator_fusion import FuseGPUOperators, GPURequiredFusionError
 from .limit_pushdown import LimitPushdownRule
 from .operator_fusion import FuseOperators, are_remote_args_compatible
 from .predicate_pushdown import PredicatePushdown
@@ -22,6 +23,8 @@ __all__ = [
     "ConfigureMapTaskMemoryRule",
     "ConfigureMapTaskMemoryUsingOutputSize",
     "FuseOperators",
+    "FuseGPUOperators",
+    "GPURequiredFusionError",
     "InheritTargetMaxBlockSizeRule",
     "LimitPushdownRule",
     "PredicatePushdown",

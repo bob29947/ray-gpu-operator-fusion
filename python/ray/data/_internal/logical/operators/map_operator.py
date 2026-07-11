@@ -30,6 +30,7 @@ from ray.data.expressions import (
     exprlist_to_fields,
 )
 from ray.data.preprocessor import Preprocessor
+from ray.data.udf_properties import UDFProperties
 
 if TYPE_CHECKING:
     from ray.data.block import Schema
@@ -234,6 +235,7 @@ class MapBatches(AbstractUDFMap):
     fn: UserDefinedFunction
     input_dependencies: list[LogicalOperator] = field(repr=False, kw_only=True)
     can_modify_num_rows: bool = False
+    udf_properties: Optional[UDFProperties] = None
     batch_size: Union[Optional[int], Literal["auto"]] = None
     batch_format: Optional[str] = "default"
     zero_copy_batch: bool = True

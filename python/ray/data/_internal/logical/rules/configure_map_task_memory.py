@@ -68,6 +68,12 @@ class ConfigureMapTaskMemoryRule(Rule, abc.ABC):
 
 
 class ConfigureMapTaskMemoryUsingOutputSize(ConfigureMapTaskMemoryRule):
+    @classmethod
+    def dependencies(cls):
+        from ray.data._internal.logical.rules.operator_fusion import FuseOperators
+
+        return [FuseOperators]
+
     def estimate_per_task_memory_requirement(self, op: MapOperator) -> Optional[int]:
         # Typically, this configuration won't make a difference because
         # `average_bytes_per_output` is usually ~128 MiB and each core usually has

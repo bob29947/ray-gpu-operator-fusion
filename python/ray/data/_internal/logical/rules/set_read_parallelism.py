@@ -98,6 +98,15 @@ class SetReadParallelismRule(Rule):
     operator will have the desired parallelism.
     """
 
+    @classmethod
+    def dependents(cls):
+        # Keep read specialization ahead of stock operator fusion.  The GPU rule
+        # declares this rule as its dependent, forming the physical rule chain:
+        # inherit target size -> GPU fusion -> read parallelism -> stock fusion.
+        from ray.data._internal.logical.rules.operator_fusion import FuseOperators
+
+        return [FuseOperators]
+
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
         ops = [plan.dag]
 

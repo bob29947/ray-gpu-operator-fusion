@@ -35,6 +35,8 @@ from ray.data.datasource import (
 )
 from ray.data.iterator import DataIterator, DatasetIterator
 from ray.data.preprocessor import Preprocessor
+from ray.data.grouped_data import MapGroupPartitionsContext
+from ray.data.udf_properties import UDFProperties
 from ray.data.read_api import (  # noqa: F401
     KafkaAuthConfig,  # noqa: F401
     from_arrow,
@@ -147,6 +149,7 @@ __all__ = [
     "ExecutionOptions",
     "ExecutionResources",
     "FileShuffleConfig",
+    "MapGroupPartitionsContext",
     "MixStoppingCondition",
     "NodeIdStr",
     "RandomSeedConfig",
@@ -156,6 +159,7 @@ __all__ = [
     "SinkMode",
     "SaveMode",
     "TaskPoolStrategy",
+    "UDFProperties",
     "from_daft",
     "from_dask",
     "from_items",

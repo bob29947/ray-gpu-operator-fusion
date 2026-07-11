@@ -1,7 +1,10 @@
 import hashlib
 import logging
 import math
+import numbers
 import os
+import pathlib
+import urllib.parse
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -78,6 +81,78 @@ Shape = Tuple[int, ...]
 TensorColumnSchema = Dict[ColumnName, Tuple[np.dtype, Shape]]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ParquetCudfDirectReadSpec:
+    """Datasource-owned capability description for a direct cuDF read.
+
+    This object is consumed on the driver.  In particular, ``filesystem`` must
+    never be copied into a GPU operator specification or actor task payload.
+    """
+
+    filesystem: Any
+    source_kind: Literal["local", "s3"]
+    paths: Tuple[str, ...]
+    listed_file_sizes: Tuple[int, ...]
+    projection: Tuple[str, ...]
+    file_schema: "pyarrow.Schema"
+    region: Optional[str]
+
+
+@dataclass(frozen=True)
+class _ParquetCudfDirectReadResult:
+    """A direct-read capability or the stable reason it is unavailable."""
+
+    spec: Optional[_ParquetCudfDirectReadSpec] = None
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if (self.spec is None) == (self.reason is None):
+            raise ValueError("Exactly one of spec or reason must be set")
+
+
+def _parquet_cudf_direct_paths_are_ambient(
+    paths: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]],
+    filesystem: Optional["pyarrow.fs.FileSystem"],
+) -> bool:
+    """Return whether GPU actors can reopen ``paths`` using ambient state.
+
+    The direct reader intentionally excludes explicit filesystems and URI-level
+    credentials/options.  Endpoint overrides are checked later by the single
+    read-recognition seam, together with source kind and region validation.
+    """
+
+    if filesystem is not None:
+        return False
+    values = paths if isinstance(paths, list) else [paths]
+    if not values:
+        return False
+    for value in values:
+        if not isinstance(value, (str, pathlib.Path)):
+            return False
+        parsed = urllib.parse.urlsplit(str(value))
+        if parsed.scheme in ("", "file"):
+            if parsed.scheme == "file" and (
+                parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or parsed.netloc not in ("", "localhost")
+            ):
+                return False
+            continue
+        if parsed.scheme != "s3":
+            return False
+        if (
+            not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+    return True
 
 
 MIN_PYARROW_TO_BATCHES_READAHEAD = parse_version("10.0.0")
@@ -398,6 +473,18 @@ class ParquetDatasource(Datasource):
         super().__init__()
         _check_pyarrow_version()
 
+        parquet_cudf_direct_options_compatible = (
+            _parquet_cudf_direct_paths_are_ambient(paths, filesystem)
+            and not dataset_kwargs
+            and not to_batch_kwargs
+            and _block_udf is None
+            and schema is None
+            and partition_filter is None
+            and shuffle is None
+            and not include_paths
+            and not include_row_hash
+        )
+
         supports_distributed_reads = not _is_local_scheme(paths)
         if not supports_distributed_reads and ray.util.client.ray.is_connected():
             raise ValueError(
@@ -536,6 +623,9 @@ class ParquetDatasource(Datasource):
             shuffle=shuffle,
             include_paths=include_paths,
             include_row_hash=include_row_hash,
+            parquet_cudf_direct_options_compatible=(
+                parquet_cudf_direct_options_compatible
+            ),
         )
 
     def _init_state(
@@ -559,6 +649,7 @@ class ParquetDatasource(Datasource):
         shuffle: Union["FileShuffleConfig", Literal["files"], None],
         include_paths: bool,
         include_row_hash: bool = False,
+        parquet_cudf_direct_options_compatible: bool = False,
     ):
         """Shared initialization for all instance state and sampling estimates.
 
@@ -573,6 +664,9 @@ class ParquetDatasource(Datasource):
         self._local_scheduling = local_scheduling
         self._source_paths_ref = source_paths_ref
         self._filesystem = filesystem
+        self._parquet_cudf_direct_options_compatible = (
+            parquet_cudf_direct_options_compatible
+        )
 
         # NOTE: Store the custom serialized `ParquetFileFragment` to avoid unexpected
         # network calls when `_ParquetDatasourceReader` is serialized. See
@@ -884,6 +978,90 @@ class ParquetDatasource(Datasource):
 
     def supports_predicate_pushdown(self) -> bool:
         return True
+
+    def _get_parquet_cudf_direct_read_spec(
+        self,
+    ) -> _ParquetCudfDirectReadResult:
+        """Return the datasource facts needed by the direct cuDF recognizer.
+
+        This method deliberately does not inspect process environment or start
+        I/O.  The planner-side recognizer owns endpoint policy, and the range
+        planner owns footer and identity validation.
+        """
+
+        import pyarrow.fs as pafs
+
+        if not self._parquet_cudf_direct_options_compatible:
+            return _ParquetCudfDirectReadResult(reason="read_options")
+        if self._predicate_expr is not None:
+            return _ParquetCudfDirectReadResult(reason="predicate")
+        if self._partition_columns:
+            return _ParquetCudfDirectReadResult(reason="partition_columns")
+
+        projection_map = self._projection_map
+        if projection_map is None:
+            projection = tuple(self._file_schema.names)
+            if (
+                not projection
+                or len(projection) != len(set(projection))
+                or any(not isinstance(name, str) or not name for name in projection)
+            ):
+                return _ParquetCudfDirectReadResult(reason="projection")
+        elif (
+            isinstance(projection_map, dict)
+            and projection_map
+            and not any(
+                not isinstance(key, str) or not key or key != value
+                for key, value in projection_map.items()
+            )
+        ):
+            projection = tuple(projection_map)
+        else:
+            return _ParquetCudfDirectReadResult(reason="projection")
+
+        filesystem = self._filesystem
+        if type(filesystem) is pafs.LocalFileSystem:
+            source_kind: Literal["local", "s3"] = "local"
+            region = None
+        elif type(filesystem) is pafs.S3FileSystem:
+            source_kind = "s3"
+            region = filesystem.region
+            if not isinstance(region, str) or not region:
+                return _ParquetCudfDirectReadResult(reason="s3_region")
+        else:
+            return _ParquetCudfDirectReadResult(reason="filesystem")
+
+        paths = tuple(self._pq_paths)
+        fragments = tuple(self._pq_fragments)
+        if (
+            not paths
+            or not all(isinstance(path, str) and path for path in paths)
+            or len(paths) != len(fragments)
+            or len(set(paths)) != len(paths)
+        ):
+            return _ParquetCudfDirectReadResult(reason="fragments")
+        if any(
+            fragment.original.path != path for path, fragment in zip(paths, fragments)
+        ):
+            return _ParquetCudfDirectReadResult(reason="fragment_paths")
+        listed_sizes = tuple(fragment.file_size for fragment in fragments)
+        if any(
+            not isinstance(size, numbers.Integral) or isinstance(size, bool) or size < 0
+            for size in listed_sizes
+        ):
+            return _ParquetCudfDirectReadResult(reason="file_sizes")
+
+        return _ParquetCudfDirectReadResult(
+            spec=_ParquetCudfDirectReadSpec(
+                filesystem=filesystem,
+                source_kind=source_kind,
+                paths=paths,
+                listed_file_sizes=tuple(int(size) for size in listed_sizes),
+                projection=projection,
+                file_schema=self._file_schema,
+                region=region,
+            )
+        )
 
     def get_current_projection(self) -> Optional[List[str]]:
         """Override to include partition columns in addition to data columns."""

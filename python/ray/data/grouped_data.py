@@ -1,10 +1,11 @@
 from collections.abc import Iterator as IteratorABC
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 from ray.data._internal.compute import ComputeStrategy
 from ray.data._internal.logical.interfaces import LogicalPlan
-from ray.data._internal.logical.operators import Aggregate
+from ray.data._internal.logical.operators import Aggregate, MapGroupPartitions
 from ray.data.aggregate import AggregateFn, Count, Max, Mean, Min, Std, Sum
 from ray.data.block import (
     Block,
@@ -16,10 +17,40 @@ from ray.data.block import (
 from ray.data.context import ShuffleStrategy
 from ray.data.dataset import EXPRESSION_API_GROUP, Dataset
 from ray.data.expressions import DownloadExpr, Expr, StarExpr
-from ray.util.annotations import PublicAPI
+from ray.util.annotations import DeveloperAPI, PublicAPI
 
 CDS_API_GROUP = "Computations or Descriptive Stats"
 FA_API_GROUP = "Function Application"
+
+
+@DeveloperAPI(stability="alpha")
+@dataclass(frozen=True)
+class MapGroupPartitionsContext:
+    """Information about the groups contained in one input partition."""
+
+    group_keys: Tuple[str, ...]
+    input_group_boundaries: Tuple[int, ...]
+
+    def __post_init__(self):
+        if not self.group_keys or any(
+            not isinstance(key, str) or not key for key in self.group_keys
+        ):
+            raise ValueError("group_keys must contain one or more non-empty strings")
+        boundaries = self.input_group_boundaries
+        if not boundaries or boundaries[0] != 0:
+            raise ValueError("input_group_boundaries must start at 0")
+        if any(
+            isinstance(boundary, bool) or not isinstance(boundary, int)
+            for boundary in boundaries
+        ):
+            raise ValueError("input_group_boundaries must contain integers")
+        if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
+            raise ValueError("input_group_boundaries must be strictly increasing")
+
+    @property
+    def num_groups(self) -> int:
+        """Number of complete groups in this input partition."""
+        return len(self.input_group_boundaries) - 1
 
 
 class GroupedData:
@@ -307,6 +338,57 @@ class GroupedData:
             ray_remote_args_fn=ray_remote_args_fn,
             **ray_remote_args,
         )
+
+    @PublicAPI(api_group=FA_API_GROUP, stability="alpha")
+    def map_group_partitions(
+        self,
+        fn: Callable[..., Union[DataBatch, Iterator[DataBatch]]],
+    ) -> "Dataset":
+        """Apply a GPU function to partitions containing complete groups.
+
+        This is an explicit opt-in fast path for a supported Parquet read followed
+        by a cuDF :meth:`~ray.data.Dataset.map_batches` operation. Ray plans disjoint
+        ranges from the leading group key, sorts each complete partition by all
+        group keys, and calls ``fn`` once for every nonempty partition. ``fn``
+        receives the cuDF partition and a :class:`MapGroupPartitionsContext`.
+
+        Before constructing the Dataset, set
+        ``DataContext.get_current().enable_gpu_operator_fusion = True``. The
+        upstream ``map_batches`` must pass
+        ``UDFProperties(preserves_partitioning=True)``. The backend validates that
+        output rows remain in the assigned leading-key range. Unlike
+        :meth:`map_groups`, this API has no general-purpose stock fallback and raises
+        an actionable planning error when the pipeline can't be fused safely.
+
+        Args:
+            fn: A function that accepts a cuDF partition and a
+                :class:`MapGroupPartitionsContext`, and returns one output batch or
+                an iterator of output batches.
+
+        Returns:
+            A dataset containing the combined outputs from all group partitions.
+        """
+        if not callable(fn):
+            raise TypeError(f"fn must be callable, got {type(fn)!r}")
+        if not isinstance(self._key, (str, list)) or not self._key:
+            raise ValueError(
+                "map_group_partitions requires one or more named group-by columns"
+            )
+        if isinstance(self._key, list) and any(
+            not isinstance(key, str) or not key for key in self._key
+        ):
+            raise ValueError(
+                "map_group_partitions requires non-empty string group-by columns"
+            )
+
+        op = MapGroupPartitions(
+            key=self._key,
+            num_partitions=self._num_partitions,
+            fn=fn,
+            input_dependencies=[self._dataset._logical_plan.dag],
+        )
+        logical_plan = LogicalPlan(op, self._dataset.context)
+        return Dataset._from_parent(self._dataset, logical_plan)
 
     @PublicAPI(api_group=EXPRESSION_API_GROUP, stability="alpha")
     def with_column(

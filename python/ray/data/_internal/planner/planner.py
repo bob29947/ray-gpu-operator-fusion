@@ -35,6 +35,7 @@ from ray.data._internal.logical.operators import (
     Join,
     Limit,
     ListFiles,
+    MapGroupPartitions,
     Mix,
     Project,
     Read,
@@ -53,6 +54,9 @@ from ray.data._internal.planner.checkpoint import (
 from ray.data._internal.planner.plan_all_to_all_op import plan_all_to_all_op
 from ray.data._internal.planner.plan_download_op import plan_download_op
 from ray.data._internal.planner.plan_list_files_op import plan_list_files_op
+from ray.data._internal.planner.plan_map_group_partitions_op import (
+    plan_map_group_partitions_op,
+)
 from ray.data._internal.planner.plan_read_files_op import plan_read_files_op
 from ray.data._internal.planner.plan_read_op import plan_read_op
 from ray.data._internal.planner.plan_udf_map_op import (
@@ -181,6 +185,7 @@ class Planner:
         Filter: plan_filter_op,
         AbstractUDFMap: plan_udf_map_op,
         AbstractAllToAll: plan_all_to_all_op,
+        MapGroupPartitions: plan_map_group_partitions_op,
         Mix: plan_mix_op,
         Union: plan_union_op,
         Zip: plan_zip_op,
@@ -198,12 +203,17 @@ class Planner:
     def __init__(self):
         self._supports_checkpointing = False
         self._plan_fns_for_checkpointing = {}
+        self._gpu_logical_root = None
+        self._gpu_consumer_counts = None
 
     def plan(
         self, logical_plan: LogicalPlan
     ) -> Tuple[PhysicalPlan, List["ExecutionCallback"]]:
         """Convert logical to physical operators recursively in post-order."""
         checkpoint_config = logical_plan.context.checkpoint_config
+        # Planner instances can be reused. Provider discovery is plan-local.
+        self._gpu_logical_root = logical_plan.dag
+        self._gpu_consumer_counts = None
 
         callbacks = [cls() for cls in logical_plan.context.execution_callback_classes]
         callbacks.append(UsageCallback(logical_plan))
@@ -266,6 +276,28 @@ class Planner:
             A tuple of the physical operator corresponding to the logical operator, and
             a mapping from physical to logical operators.
         """
+        # GPU providers must match before stock children are recursively planned.
+        # Otherwise a consumed stock subtree would be built and then discarded.
+        if data_context.enable_gpu_operator_fusion:
+            from ray.data._internal.planner.gpu_plan_provider import (
+                has_gpu_plan_provider,
+                plan_with_gpu_provider,
+            )
+
+            if has_gpu_plan_provider(logical_op):
+                from ray.data._internal.planner.gpu_plan_validation import (
+                    validate_gpu_plan_fragment,
+                )
+
+                fragment = plan_with_gpu_provider(
+                    logical_op,
+                    data_context,
+                    self._get_gpu_logical_consumer_counts(),
+                )
+                if fragment is not None:
+                    validate_gpu_plan_fragment(fragment)
+                    return fragment.root, dict(fragment.op_map)
+
         op_map: Dict[PhysicalOperator, LogicalOperator] = {}
 
         # Plan the input dependencies first.
@@ -298,6 +330,27 @@ class Planner:
         # Also add the final operator (in case the loop didn't catch it)
         op_map[physical_op] = logical_op
         return physical_op, op_map
+
+    def _get_gpu_logical_consumer_counts(self) -> Dict[LogicalOperator, int]:
+        """Compute consumer counts lazily after an exact provider-root hit."""
+
+        if self._gpu_consumer_counts is not None:
+            return self._gpu_consumer_counts
+        assert self._gpu_logical_root is not None
+        counts: Dict[LogicalOperator, int] = {}
+        visited = set()
+        stack = [self._gpu_logical_root]
+        while stack:
+            op = stack.pop()
+            if op in visited:
+                continue
+            visited.add(op)
+            counts.setdefault(op, 0)
+            for child in op.input_dependencies:
+                counts[child] = counts.get(child, 0) + 1
+                stack.append(child)
+        self._gpu_consumer_counts = counts
+        return counts
 
     def _create_checkpoint_callback(
         self,

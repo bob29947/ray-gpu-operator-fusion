@@ -138,6 +138,7 @@ from ray.data.datatype import DataType
 from ray.data.exceptions import omit_traceback_stdout
 from ray.data.iterator import DataIterator
 from ray.data.random_access_dataset import RandomAccessDataset
+from ray.data.udf_properties import UDFProperties
 from ray.types import ObjectRef
 from ray.util.annotations import Deprecated, DeveloperAPI, PublicAPI
 from ray.util.debug import log_once
@@ -545,6 +546,7 @@ class Dataset:
         memory: Optional[float] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
         udf_modifying_row_count: bool = True,
+        udf_properties: Optional[UDFProperties] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         **ray_remote_args,
     ) -> "Dataset":
@@ -728,6 +730,13 @@ class Dataset:
             udf_modifying_row_count: If your UDF produces the same number of output rows
                 as it receives, set this parameter to False. It allows Ray Data to
                 perform more optimizations like limit pushdown.
+            udf_properties: Optional semantic assertions about the UDF. These are
+                consumed only by compatible opt-in execution backends and don't change
+                ordinary ``map_batches`` execution. In particular,
+                ``preserves_partitioning=True`` means output rows remain owned by the
+                same known logical input partition; it doesn't imply unchanged row
+                count, key values, ordering, schema, determinism, purity, or batch
+                independence.
             ray_remote_args_fn: A function that returns a dictionary of remote args
                 passed to each map worker. The purpose of this argument is to generate
                 dynamic arguments for each actor/task, and will be called each time prior
@@ -799,6 +808,7 @@ class Dataset:
             memory=memory,
             concurrency=concurrency,
             udf_modifying_row_count=udf_modifying_row_count,
+            udf_properties=udf_properties,
             ray_remote_args_fn=ray_remote_args_fn,
             **ray_remote_args,
         )
@@ -821,6 +831,7 @@ class Dataset:
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]],
         udf_modifying_row_count: bool,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]],
+        udf_properties: Optional[UDFProperties] = None,
         **ray_remote_args,
     ):
         # NOTE: The `map_groups` implementation calls `map_batches` with
@@ -856,6 +867,7 @@ class Dataset:
             input_dependencies=[self._logical_plan.dag],
             batch_size=batch_size,
             can_modify_num_rows=udf_modifying_row_count,
+            udf_properties=udf_properties,
             batch_format=batch_format,
             zero_copy_batch=zero_copy_batch,
             min_rows_per_bundled_input=min_rows_per_bundled_input,

@@ -537,6 +537,10 @@ class DataContext:
             driver-side first-file sampling for schema inference,
             ``ParquetScanner`` / ``ParquetFileReader``). Defaults to False — V1
             remains the production path while V2 bakes.
+        enable_gpu_operator_fusion: Whether to enable the opt-in GPU operator
+            lowering and physical-fusion path used by
+            :meth:`~ray.data.grouped_data.GroupedData.map_group_partitions`.
+            Defaults to False. Ordinary Ray Data GPU operations are unaffected.
         parquet_chunker_target_chunk_size: Target on-disk bytes per chunk used
             by ``ParquetFileChunker``. The chunker reads each file's footer at
             listing time and bundles consecutive row groups until their on-disk
@@ -804,6 +808,7 @@ class DataContext:
     min_parallelism: int = DEFAULT_MIN_PARALLELISM
     read_op_min_num_blocks: int = DEFAULT_READ_OP_MIN_NUM_BLOCKS
     use_datasource_v2: bool = DEFAULT_USE_DATASOURCE_V2
+    enable_gpu_operator_fusion: bool = False
     # Target on-disk bytes per chunk for ``ParquetFileChunker`` (bundles
     # consecutive row groups up to this size, >= 1 row group). When ``None``,
     # falls back to ``target_min_block_size``.
