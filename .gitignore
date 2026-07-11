@@ -254,3 +254,12 @@ CLAUDE.local.md
 # Worktrees
 .worktrees/
 .claude/worktrees/
+
+# Local development and benchmark state (never publish).
+/.venv/
+/.wheel-build.*/
+/artifacts/
+/outputs/
+/wheels/
+*.whl
+cufile.log
