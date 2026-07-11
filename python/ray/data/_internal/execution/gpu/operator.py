@@ -24,6 +24,13 @@ class GPUOperatorCreationOptions:
         downstream: "GPUOperatorCreationOptions",
         spec: GPUOperatorSpec,
     ) -> "GPUOperatorCreationOptions":
+        """Keep options owned by the fused operator's external boundaries.
+
+        Input bundling belongs to the upstream-most node, output block sizing
+        belongs to the downstream-most node, and the name describes the full
+        fused transform sequence.
+        """
+
         target = (
             downstream.target_max_block_size_override
             if downstream.target_max_block_size_override is not None

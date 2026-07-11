@@ -183,6 +183,8 @@ class FuseGPUOperators(Rule):
                 f"physical operator: {detail}. V1 requires a complete fused "
                 "range-read region."
             )
+        # V1 rejects additional marker GPU operators even when they do not
+        # themselves require complete fusion.
         if len(gpu_ops) != 1:
             raise GPURequiredFusionError(
                 "GPU V1 supports only one activated GPU region per Dataset execution"

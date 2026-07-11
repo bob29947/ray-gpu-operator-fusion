@@ -13,7 +13,7 @@ from ray.data._internal.execution.gpu.runtime import (
 )
 
 
-def create_gpu_transform_runtime(
+def _create_cudf_transform_runtime(
     kind: str,
     config: Any,
     context: CudfRuntimeContext,
@@ -65,7 +65,7 @@ def _registered_runtime_factory(
     """Bridge the durable registry to one cuDF context shared by the actor."""
 
     cudf_context = shared_context.get_or_create("cudf_runtime", CudfRuntimeContext)
-    return create_gpu_transform_runtime(
+    return _create_cudf_transform_runtime(
         transform_spec.kind, transform_spec.config, cudf_context
     )
 
@@ -83,4 +83,4 @@ for _kind in (
     )
 
 
-__all__ = ["CudfRuntimeContext", "create_gpu_transform_runtime"]
+__all__ = ["CudfRuntimeContext"]

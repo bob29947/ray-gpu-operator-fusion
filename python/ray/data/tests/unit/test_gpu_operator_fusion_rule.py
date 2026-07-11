@@ -13,6 +13,7 @@ from ray.data._internal.execution.gpu import (
     GPUOperatorSpec,
     GPUTransformSpec,
     PayloadKind,
+    compose_gpu_operator_specs,
     create_gpu_operator,
     register_gpu_operator_factory,
 )
@@ -157,6 +158,44 @@ def test_gpu_rule_fuses_maximal_chain_and_rewrites_op_map_idempotently():
     )
 
 
+def test_fused_creation_options_follow_external_boundaries():
+    read_spec = _spec(
+        "read",
+        PayloadKind.RANGE_WORK,
+        PayloadKind.CUDF_BATCH_STREAM,
+        "Read",
+    )
+    group_spec = _spec(
+        "group",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.OUTPUT_BATCH_STREAM,
+        "MapGroupPartitions",
+    )
+    fused_spec = compose_gpu_operator_specs(read_spec, group_spec)
+    upstream = GPUOperatorCreationOptions(
+        name="GPURead",
+        min_rows_per_bundle=1,
+        target_max_block_size_override=128,
+    )
+    downstream = GPUOperatorCreationOptions(
+        name="GPUGroup",
+        min_rows_per_bundle=999,
+        target_max_block_size_override=256,
+    )
+
+    fused = upstream.for_fused_spec(downstream, fused_spec)
+
+    assert fused.name == "GPU[read,group]"
+    assert fused.min_rows_per_bundle == 1
+    assert fused.target_max_block_size_override == 256
+    assert (
+        upstream.for_fused_spec(
+            replace(downstream, target_max_block_size_override=None), fused_spec
+        ).target_max_block_size_override
+        == 128
+    )
+
+
 def test_gpu_rule_flag_off_is_exact_noop():
     plan = _three_node_plan()
     plan.context.enable_gpu_operator_fusion = False
@@ -181,6 +220,28 @@ def test_required_complete_region_fuses_and_validates_provenance():
         "MapBatches",
         "MapGroupPartitions",
     )
+
+
+def test_required_complete_region_rejects_an_additional_optional_gpu_marker():
+    required = FuseGPUOperators().apply(_three_node_plan(complete=True))
+    context = required.context
+    optional_source = InputDataBuffer(context, input_data=[])
+    optional_spec = replace(
+        _spec(
+            "optional",
+            PayloadKind.RAY_BLOCK_STREAM,
+            PayloadKind.RAY_BLOCK_STREAM,
+            "Optional",
+        ),
+        region_id="optional-region",
+    )
+    optional = create_gpu_operator(optional_spec, optional_source, context)
+    root = PhysicalOperator("SyntheticTwoInput", [required.dag, optional], context)
+
+    with pytest.raises(
+        GPURequiredFusionError, match="only one activated GPU region"
+    ):
+        FuseGPUOperators().apply(PhysicalPlan(root, {}, context))
 
 
 def test_gpu_physical_rule_order_is_explicit():

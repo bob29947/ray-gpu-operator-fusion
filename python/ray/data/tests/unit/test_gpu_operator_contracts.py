@@ -249,6 +249,34 @@ def test_range_prefix_semantically_satisfies_colocation_after_validation():
     assert composed.transform_ids == ("map", "validate", "grouped")
 
 
+def test_range_prefix_satisfaction_does_not_bypass_validation_obligation():
+    obligation = RowsOwnedByRange("User", "scheme")
+    range_fact = PropertyFact(
+        RangePartitioning(("User",), "scheme"), Evidence.USER_ASSERTED
+    )
+    map_spec = _spec(
+        "map",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+        properties=(range_fact,),
+        creates=(obligation,),
+    )
+    grouped_spec = _spec(
+        "grouped",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.OUTPUT_BATCH_STREAM,
+        requirements=(KeysColocated(("User", "Card")),),
+        requires_resolved=True,
+    )
+
+    with pytest.raises(GPUCompositionError) as exc_info:
+        compose_gpu_operator_specs(map_spec, grouped_spec)
+    assert (
+        exc_info.value.reason
+        is GPUCompositionErrorReason.UNRESOLVED_VALIDATION_OBLIGATION
+    )
+
+
 def test_generic_region_worker_runs_synthetic_transforms_in_order():
     def add_one(values, _context):
         return (value + 1 for value in values)

@@ -101,6 +101,8 @@ def property_satisfies(
     if isinstance(requirement, KeysColocated):
         if not isinstance(value, RangePartitioning):
             return False
+        # Prefix satisfaction does not discharge RowsOwnedByRange; dependent
+        # transforms must require resolved obligations before using this fact.
         # Disjoint ranges on a nonempty prefix guarantee that equal values for
         # all requested keys are assigned to the same range.
         return (
