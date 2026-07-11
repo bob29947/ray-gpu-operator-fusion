@@ -6,7 +6,7 @@ pytest-asyncio
 # ---------------------
 # Atari
 ale_py==0.10.1
-imageio==2.34.2
+imageio==2.37.3
 opencv-python-headless==4.10.0.84
 
 # For testing MuJoCo envs with gymnasium.
