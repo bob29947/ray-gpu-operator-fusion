@@ -98,4 +98,3 @@ def plan_with_gpu_provider(
         assert isinstance(result, GPUProviderAccepted), result
         return result.fragment
     return None
-

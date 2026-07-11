@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "validated": true,
+  "revisions": {
+    "stock_ray": "2741c6461d2bd3e5ff114af67be7a1190453dadd",
+    "modified_ray": "e05da7b3132296c9420fa1f77efbd8cb68cae422"
+  },
+  "wheel_sha256": {
+    "stock": "fee51e2415cb4f4f46fb81d23ad0ff557600f8278c7aefc782cf2b7301668dea",
+    "modified": "ba167868afd4f6fdb7453cef20f95bd3078fceff162a199093e87037f690bb34"
+  },
+  "logical_output": {
+    "algorithm": "sha256-sorted-row-sha256-v1",
+    "rows": 1229748,
+    "sha256": "cd440f692ed6e69f3980600a73afdb730b29ec67a8725bfbb484cc0b15edec85",
+    "dtype": "uint16",
+    "shape": [4096]
+  },
+  "timing_seconds": {
+    "stock_legacy": 123.13189396075904,
+    "modified_legacy": 122.0310517642647,
+    "modified_v1": 13.59056992456317
+  },
+  "physical_plan": {
+    "stock_legacy": "hash shuffle; zero GPU fusion nodes",
+    "modified_legacy": "hash shuffle; zero GPU fusion nodes",
+    "modified_v1": "one fused GPU operator; no exchange"
+  },
+  "gates": {
+    "modified_legacy_relative_to_stock": -0.008940349742733389,
+    "modified_v1_seconds": 13.59056992456317,
+    "modified_v1_speedup_over_stock": 9.060097894659615,
+    "legacy_absolute_relative_tolerance": 0.1,
+    "modified_v1_max_seconds": 17.15,
+    "modified_v1_min_speedup": 7.0
+  },
+  "known_legacy_limitation": {
+    "stage": "Arrow-to-cuDF conversion",
+    "batch_size_rows": 1048576,
+    "error": "cudaErrorInvalidValue",
+    "affects_new_fused_operator": false
+  }
+}

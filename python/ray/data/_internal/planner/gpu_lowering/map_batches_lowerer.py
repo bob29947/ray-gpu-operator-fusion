@@ -80,4 +80,3 @@ class GPUMapBatchesLowerer:
                 target_max_block_size_override=context.target_max_block_size,
             ),
         )
-

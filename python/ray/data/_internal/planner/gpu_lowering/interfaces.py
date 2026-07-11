@@ -73,4 +73,3 @@ class GPULogicalLowererRegistry:
                 f"No GPU lowerer for exact logical type {type(logical_op).__name__}"
             )
         return lowerer.lower(logical_op, context)
-

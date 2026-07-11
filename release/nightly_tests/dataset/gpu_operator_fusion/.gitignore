@@ -1,0 +1,7 @@
+/.work/
+/artifacts/
+/outputs/
+__pycache__/
+*.py[cod]
+*.whl
+cufile.log

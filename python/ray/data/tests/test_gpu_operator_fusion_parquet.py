@@ -89,4 +89,3 @@ def test_parquet_map_group_partitions_executes_one_fused_gpu_operator(
     assert "GPU[read_parquet_range,map_batches,validate_range_ownership," in stats
     assert "sort_partition,build_group_boundaries,map_group_partitions]" in stats
     assert "Repartition" not in stats
-

@@ -1,3 +1,19 @@
+Ray GPU Operator Fusion V1
+==========================
+
+This repository is an experimental Ray fork for modular, physical-optimizer
+GPU operator fusion in Ray Data. The default branch contains the modified
+implementation; stock Ray is preserved at commit
+``2741c6461d2bd3e5ff114af67be7a1190453dadd`` in the same Git history.
+
+See the `self-contained stock-versus-modified benchmark
+<release/nightly_tests/dataset/gpu_operator_fusion/README.md>`__ for the
+architecture summary, pinned environments, reproduction commands, validation
+record, and performance gates.
+
+Upstream Ray
+------------
+
 .. image:: https://github.com/ray-project/ray/raw/master/doc/source/images/ray_header_logo.png
 
 .. image:: https://readthedocs.org/projects/ray/badge/?version=master
