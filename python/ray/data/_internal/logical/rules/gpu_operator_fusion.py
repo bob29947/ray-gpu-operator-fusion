@@ -135,6 +135,10 @@ class FuseGPUOperators(Rule):
 
             candidate = [upstream] + chain
             try:
+                # Rebuild the candidate with compile_gpu_region instead of
+                # prepending to the previous result. This keeps fusion on the
+                # canonical code path and avoids assuming future spec fields
+                # compose identically in either order.
                 compiled_spec = compile_gpu_region(
                     node.gpu_operator_spec  # type: ignore[attr-defined]
                     for node in candidate
