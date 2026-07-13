@@ -7,9 +7,14 @@ import numbers
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from ray.data._internal.execution.gpu.parquet_types import ParquetRangeWork, RangeData
+from ray.data._internal.execution.gpu.payloads import GroupedRangeData, RangeData
 from ray.data._internal.execution.gpu.transforms._runtime_support import (
     CudfRuntimeContext,
+)
+from ray.data._internal.execution.gpu.transforms._user_code import (
+    invoke_user_code,
+    iterate_user_code,
+    raise_user_code_exception,
 )
 
 SORT_PARTITION_KIND = "sort_partition"
@@ -53,13 +58,6 @@ class MapGroupPartitionsConfig:
             or self.target_max_block_size <= 0
         ):
             raise ValueError("target_max_block_size must be a positive integer")
-
-
-@dataclass(frozen=True, eq=False)
-class GroupedPartitionData:
-    work: ParquetRangeWork
-    frame: Any
-    boundaries: tuple[int, ...]
 
 
 def is_sorted(frame: Any, keys: tuple[str, ...]) -> bool:
@@ -161,7 +159,7 @@ class SortPartitionRuntime:
             raise TypeError("sort_partition expected actor-local RangeData")
         frames = list(value.value)
         if not frames:
-            return RangeData(value.work, None)
+            return RangeData(value.partition, None)
         frame = (
             frames[0]
             if len(frames) == 1
@@ -169,14 +167,16 @@ class SortPartitionRuntime:
         )
         frames.clear()
         if any(key not in frame for key in self._config.group_keys):
-            raise ValueError("The GPU map_batches UDF removed a group key")
+            raise_user_code_exception(
+                ValueError("The GPU map_batches UDF removed a group key")
+            )
         if not is_sorted(frame, self._config.group_keys):
             frame = frame.sort_values(
                 list(self._config.group_keys),
                 ignore_index=True,
                 na_position="last",
             )
-        return RangeData(value.work, frame)
+        return RangeData(value.partition, frame)
 
 
 class BuildGroupBoundariesRuntime:
@@ -195,28 +195,33 @@ class BuildGroupBoundariesRuntime:
     def initialize(self) -> None:
         self._context.ensure_cudf()
 
-    def apply(self, value: Any, task_context: Any) -> GroupedPartitionData:
+    def apply(self, value: Any, task_context: Any) -> GroupedRangeData:
         del task_context
         if not isinstance(value, RangeData):
             raise TypeError("group-boundary construction expected RangeData")
         if value.value is None:
-            return GroupedPartitionData(value.work, None, (0,))
+            return GroupedRangeData(value.partition, None, (0,))
         boundaries = group_boundaries(
             value.value, self._config.group_keys, self._context.cupy
         )
-        return GroupedPartitionData(value.work, value.value, boundaries)
+        return GroupedRangeData(value.partition, value.value, boundaries)
 
 
 class MapGroupPartitionsRuntime:
-    def __init__(self, config: MapGroupPartitionsConfig) -> None:
+    def __init__(
+        self,
+        config: MapGroupPartitionsConfig,
+        context: CudfRuntimeContext,
+    ) -> None:
         if not isinstance(config, MapGroupPartitionsConfig):
             raise TypeError("map_group_partitions requires MapGroupPartitionsConfig")
         self._config = config
+        self._context = context
 
     def initialize(self) -> None:
-        pass
+        self._context.ensure_cudf()
 
-    def _apply_partition(self, value: GroupedPartitionData) -> Iterator[Any]:
+    def _apply_partition(self, value: GroupedRangeData) -> Iterator[Any]:
         if value.frame is None:
             return
         from ray.data.grouped_data import MapGroupPartitionsContext
@@ -225,15 +230,24 @@ class MapGroupPartitionsRuntime:
             group_keys=self._config.group_keys,
             input_group_boundaries=value.boundaries,
         )
-        result = self._config.partition_fn(value.frame, context)
-        from ray.data.block import BlockAccessor
+        result = invoke_user_code(self._config.partition_fn, value.frame, context)
+        for output in iterate_user_code(_one_or_generator(result)):
+            try:
+                if not isinstance(output, self._context.cudf.DataFrame):
+                    raise TypeError(
+                        "The GPU map_group_partitions UDF must return cuDF "
+                        "DataFrames"
+                    )
+                output = output.reset_index(drop=True)
+                for batch in split_output(
+                    output, int(self._config.target_max_block_size)
+                ):
+                    yield batch
+            except Exception as error:
+                raise_user_code_exception(error)
 
-        for output in _one_or_generator(result):
-            for batch in split_output(output, int(self._config.target_max_block_size)):
-                yield BlockAccessor.batch_to_block(batch)
-
-    def apply(self, value: Any, task_context: Any) -> Iterator[Any]:
+    def apply(self, value: Any, task_context: Any) -> RangeData:
         del task_context
-        if not isinstance(value, GroupedPartitionData):
-            raise TypeError("map_group_partitions expected GroupedPartitionData")
-        return self._apply_partition(value)
+        if not isinstance(value, GroupedRangeData):
+            raise TypeError("map_group_partitions expected GroupedRangeData")
+        return RangeData(value.partition, self._apply_partition(value))

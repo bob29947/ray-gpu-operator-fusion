@@ -38,7 +38,9 @@ class GPUOperatorCreationOptions:
         )
         return replace(
             self,
-            name="GPU[" + ",".join(spec.transform_ids) + "]",
+            name="GPU["
+            + ",".join(transform.kind for transform in spec.transforms)
+            + "]",
             target_max_block_size_override=target,
         )
 
@@ -63,8 +65,7 @@ class GPUOperator(ABC):
 
 
 class GPUOperatorFactory(Protocol):
-    def supports(self, spec: GPUOperatorSpec) -> bool:
-        ...
+    def supports(self, spec: GPUOperatorSpec) -> bool: ...
 
     def create(
         self,
@@ -72,8 +73,7 @@ class GPUOperatorFactory(Protocol):
         input_op: "PhysicalOperator",
         data_context: "DataContext",
         creation_options: Optional[GPUOperatorCreationOptions] = None,
-    ) -> "PhysicalOperator":
-        ...
+    ) -> "PhysicalOperator": ...
 
 
 _GPU_OPERATOR_FACTORIES: Dict[str, GPUOperatorFactory] = {}

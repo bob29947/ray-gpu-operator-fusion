@@ -17,6 +17,7 @@ from ray.data.block import (
 from ray.data.context import ShuffleStrategy
 from ray.data.dataset import EXPRESSION_API_GROUP, Dataset
 from ray.data.expressions import DownloadExpr, Expr, StarExpr
+from ray.data.udf_properties import UDFProperties
 from ray.util.annotations import DeveloperAPI, PublicAPI
 
 CDS_API_GROUP = "Computations or Descriptive Stats"
@@ -343,27 +344,42 @@ class GroupedData:
     def map_group_partitions(
         self,
         fn: Callable[..., Union[DataBatch, Iterator[DataBatch]]],
+        *,
+        udf_properties: Optional[UDFProperties] = None,
     ) -> "Dataset":
         """Apply a GPU function to partitions containing complete groups.
 
         This is an explicit opt-in fast path for a supported Parquet read followed
-        by a cuDF :meth:`~ray.data.Dataset.map_batches` operation. Ray plans disjoint
-        ranges from the leading group key, sorts each complete partition by all
-        group keys, and calls ``fn`` once for every nonempty partition. ``fn``
-        receives the cuDF partition and a :class:`MapGroupPartitionsContext`.
+        by GPU-eligible :meth:`~ray.data.Dataset.map_batches` and
+        ``map_group_partitions`` operations. Ray plans disjoint ranges from the
+        leading group key, sorts each complete partition by all group keys, and
+        invokes ``fn`` for every nonempty partition. ``fn`` receives the cuDF
+        partition and a :class:`MapGroupPartitionsContext`.
 
         Before constructing the Dataset, set
-        ``DataContext.get_current().enable_gpu_operator_fusion = True``. The
-        upstream ``map_batches`` must pass
-        ``UDFProperties(preserves_partitioning=True)``. The backend validates that
-        output rows remain in the assigned leading-key range. Unlike
-        :meth:`map_groups`, this API has no general-purpose stock fallback and raises
-        an actionable planning error when the pipeline can't be fused safely.
+        ``DataContext.get_current().enable_gpu_operator_fusion = True``. A GPU
+        operation whose output must feed a later partition-dependent
+        operation must pass ``UDFProperties(preserves_partitioning=True)``. The
+        backend validates that output rows remain in the assigned leading-key
+        range. Unlike :meth:`map_groups`, this API has no general-purpose stock
+        fallback and raises an actionable planning error when gate 2 can't build a
+        valid GPU stage.
+
+        Ray may invoke ``fn`` again after a retry or actor restart. Side effects
+        therefore have at-least-once semantics; execution is not exactly once.
+
+        On the specialized GPU path, ``max_errored_blocks`` counts a complete
+        planned range/partition. Dropping one failed unit may therefore discard
+        substantially more data than dropping a stock-sized block.
 
         Args:
             fn: A function that accepts a cuDF partition and a
                 :class:`MapGroupPartitionsContext`, and returns one output batch or
-                an iterator of output batches.
+                an iterator of cuDF output batches.
+            udf_properties: Optional semantic assertions about ``fn``. These
+                assertions do not change ordinary execution behavior. The GPU
+                planner may use them to prove whether partitioning properties are
+                preserved across this operation.
 
         Returns:
             A dataset containing the combined outputs from all group partitions.
@@ -385,6 +401,7 @@ class GroupedData:
             key=self._key,
             num_partitions=self._num_partitions,
             fn=fn,
+            udf_properties=udf_properties,
             input_dependencies=[self._dataset._logical_plan.dag],
         )
         logical_plan = LogicalPlan(op, self._dataset.context)

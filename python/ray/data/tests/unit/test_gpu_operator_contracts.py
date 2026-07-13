@@ -1,26 +1,47 @@
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 from ray import cloudpickle
 
 from ray.data._internal.execution.gpu import (
+    CompletePartitionBundles,
     Evidence,
-    GPUBoundaryPolicy,
+    GPUBoundaryAdapter,
+    GPUBoundaryDirection,
     GPUCompositionError,
     GPUCompositionErrorReason,
     GPUExecutionCompatibilityKey,
     GPUExecutionRequirements,
     GPUOperatorSpec,
+    GPUStageRetryPolicy,
     GPUTransformSpec,
+    GroupedRangeData,
     KeysColocated,
+    PartitionIdentity,
     PayloadKind,
     PropertyFact,
+    PropertyRequirement,
+    PropertyValue,
+    RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    RANGE_DATA_TERMINAL_ADAPTER_KEY,
+    RANGE_WORK_ADAPTER_KEY,
+    RangeData,
     RangePartitioning,
+    RangePartitionIdentity,
     RowsOwnedByRange,
+    UnknownPartitioning,
     compile_gpu_region,
     compose_gpu_operator_specs,
+    get_gpu_boundary_adapter,
+    property_satisfies,
+    register_gpu_boundary_adapter,
+    register_property_satisfaction,
+    unregister_gpu_boundary_adapter,
 )
-from ray.data._internal.execution.gpu.runtime import GPURegionWorker
+from ray.data._internal.execution.gpu.runtime import (
+    GPURegionBlockTransform,
+    GPURegionWorker,
+)
 
 
 class _ExplodingEq:
@@ -33,13 +54,15 @@ class _ExplodingEq:
 
 def _spec(
     transform_id,
-    input_payload,
-    output_payload,
+    native_input,
+    native_output,
     *,
     key=None,
     requirements=(),
     properties=(),
-    boundary=GPUBoundaryPolicy.ELIDABLE,
+    input_adapter=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    output_adapter=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    terminal_output_adapter=RANGE_DATA_TERMINAL_ADAPTER_KEY,
     creates=(),
     discharges=(),
     requires_resolved=False,
@@ -48,27 +71,30 @@ def _spec(
     if key is None:
         key = GPUExecutionCompatibilityKey(num_gpus=0)
     return GPUOperatorSpec(
+        spec_instance_id=transform_id,
         transforms=(
             GPUTransformSpec(
                 transform_id=transform_id,
                 kind=transform_id,
-                input_payload=input_payload,
-                output_payload=output_payload,
+                input_payload=native_input,
+                output_payload=native_output,
                 config=config or _ExplodingEq(),
                 creates_obligations=creates,
                 discharges_obligations=discharges,
                 requires_resolved_obligations=requires_resolved,
             ),
         ),
-        input_payload=input_payload,
-        output_payload=output_payload,
-        execution_requirements=GPUExecutionRequirements(
-            compatibility_key=key
-        ),
+        external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
+        external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
+        native_input_payload=native_input,
+        native_output_payload=native_output,
+        input_adapter_key=input_adapter,
+        output_adapter_key=output_adapter,
+        terminal_output_adapter_key=terminal_output_adapter,
+        execution_requirements=GPUExecutionRequirements(compatibility_key=key),
         input_requirements=requirements,
         output_properties=properties,
         logical_provenance=(transform_id,),
-        region_id="test-region",
     )
 
 
@@ -76,23 +102,30 @@ def test_compose_is_pairwise_pure_associative_and_serializable():
     range_fact = PropertyFact(
         RangePartitioning(("User",), "scheme"), Evidence.OPERATOR_GUARANTEE
     )
+    complete_fact = PropertyFact(
+        CompletePartitionBundles(), Evidence.OPERATOR_GUARANTEE
+    )
     a = _spec(
-        "a",
-        PayloadKind.RAY_BLOCK_STREAM,
-        PayloadKind.CUDF_BATCH_STREAM,
-        properties=(range_fact,),
+        "read/0/read",
+        PayloadKind.RANGE_WORK,
+        PayloadKind.RANGE_DATA,
+        properties=(range_fact, complete_fact),
+        input_adapter=RANGE_WORK_ADAPTER_KEY,
     )
     b = _spec(
-        "b",
-        PayloadKind.CUDF_BATCH_STREAM,
-        PayloadKind.CUDF_PARTITION,
-        requirements=(KeysColocated(("User", "Card")),),
-        properties=(range_fact,),
+        "map/0/map",
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+        properties=(range_fact, complete_fact),
     )
     c = _spec(
-        "c",
-        PayloadKind.CUDF_PARTITION,
-        PayloadKind.OUTPUT_BATCH_STREAM,
+        "mgp/0/group",
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+        requirements=(
+            KeysColocated(("User", "Card")),
+            CompletePartitionBundles(),
+        ),
     )
     before = (a.canonical_contract(), b.canonical_contract(), c.canonical_contract())
 
@@ -102,6 +135,15 @@ def test_compose_is_pairwise_pure_associative_and_serializable():
 
     assert left.canonical_contract() == right.canonical_contract()
     assert left.canonical_contract() == folded.canonical_contract()
+    assert folded.spec_instance_id == ("gpu-stage[read/0/read,map/0/map,mgp/0/group]")
+    assert folded.external_input_payload is PayloadKind.RAY_BLOCK_STREAM
+    assert folded.external_output_payload is PayloadKind.RAY_BLOCK_STREAM
+    assert folded.native_input_payload is PayloadKind.RANGE_WORK
+    assert folded.native_output_payload is PayloadKind.RANGE_DATA
+    assert folded.input_adapter_key == RANGE_WORK_ADAPTER_KEY
+    assert folded.output_adapter_key == RANGE_DATA_BOUNDARY_ADAPTER_KEY
+    assert folded.terminal_output_adapter_key == RANGE_DATA_TERMINAL_ADAPTER_KEY
+    assert folded.active_output_adapter_key == RANGE_DATA_BOUNDARY_ADAPTER_KEY
     assert before == (
         a.canonical_contract(),
         b.canonical_contract(),
@@ -117,71 +159,65 @@ def test_compose_is_pairwise_pure_associative_and_serializable():
         (
             _spec(
                 "a",
-                PayloadKind.RAY_BLOCK_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
                 PayloadKind.CUDF_BATCH_STREAM,
             ),
             _spec(
                 "b",
                 PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.OUTPUT_BATCH_STREAM,
-                key=GPUExecutionCompatibilityKey(
-                    runtime_id="different", num_gpus=0
-                ),
+                PayloadKind.CUDF_BATCH_STREAM,
+                key=GPUExecutionCompatibilityKey(runtime_id="different", num_gpus=0),
             ),
             GPUCompositionErrorReason.EXECUTION_INCOMPATIBLE,
         ),
         (
             _spec(
                 "a",
-                PayloadKind.RAY_BLOCK_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
                 PayloadKind.CUDF_BATCH_STREAM,
             ),
             _spec(
                 "b",
                 PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.OUTPUT_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
                 requirements=(KeysColocated(("key",)),),
             ),
             GPUCompositionErrorReason.INPUT_REQUIREMENTS_UNSATISFIED,
         ),
         (
-            _spec(
-                "a", PayloadKind.RAY_BLOCK_STREAM, PayloadKind.CUDF_PARTITION
-            ),
+            _spec("a", PayloadKind.CUDF_BATCH_STREAM, PayloadKind.CUDF_PARTITION),
             _spec(
                 "b",
                 PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.OUTPUT_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
             ),
             GPUCompositionErrorReason.PAYLOAD_INCOMPATIBLE,
         ),
         (
-            replace(
-                _spec(
-                    "a",
-                    PayloadKind.RAY_BLOCK_STREAM,
-                    PayloadKind.CUDF_BATCH_STREAM,
-                ),
-                output_boundary=GPUBoundaryPolicy.REQUIRED,
+            _spec(
+                "a",
+                PayloadKind.CUDF_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
+                output_adapter="different-adapter-v1",
             ),
             _spec(
                 "b",
                 PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.OUTPUT_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
             ),
-            GPUCompositionErrorReason.PHYSICAL_BOUNDARY_REQUIRED,
+            GPUCompositionErrorReason.ADAPTER_INCOMPATIBLE,
         ),
         (
             _spec(
                 "a",
-                PayloadKind.RAY_BLOCK_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
                 PayloadKind.CUDF_BATCH_STREAM,
                 creates=(RowsOwnedByRange("User", "scheme"),),
             ),
             _spec(
                 "b",
                 PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.OUTPUT_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
                 requires_resolved=True,
             ),
             GPUCompositionErrorReason.UNRESOLVED_VALIDATION_OBLIGATION,
@@ -189,15 +225,31 @@ def test_compose_is_pairwise_pure_associative_and_serializable():
         (
             _spec(
                 "duplicate",
-                PayloadKind.RAY_BLOCK_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
                 PayloadKind.CUDF_BATCH_STREAM,
             ),
             _spec(
                 "duplicate",
                 PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.OUTPUT_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
             ),
             GPUCompositionErrorReason.DUPLICATE_TRANSFORM_ID,
+        ),
+        (
+            _spec(
+                "sealed",
+                PayloadKind.CUDF_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
+            ).for_gate2_stage(
+                specialized_read_parallelism_resolved=True,
+                uses_terminal_output_adapter=True,
+            ),
+            _spec(
+                "adjacent",
+                PayloadKind.CUDF_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
+            ),
+            GPUCompositionErrorReason.SEALED_GATE2_STAGE,
         ),
     ],
 )
@@ -207,49 +259,105 @@ def test_compose_stable_error_codes(upstream, downstream, reason):
     assert exc_info.value.reason is reason
 
 
-def test_range_prefix_semantically_satisfies_colocation_after_validation():
-    obligation = RowsOwnedByRange("User", "scheme")
+def test_retry_policy_is_canonical_and_part_of_execution_compatibility():
+    disabled_with_irrelevant_limits = GPUStageRetryPolicy(
+        actor_init_retry_on_errors=False,
+        actor_init_max_retries=99,
+        retried_map_errors=False,
+        max_map_retries=99,
+        retried_io_errors=["slow down"],
+    )
+    disabled_canonical = GPUStageRetryPolicy(
+        actor_init_retry_on_errors=False,
+        actor_init_max_retries=0,
+        retried_map_errors=False,
+        max_map_retries=0,
+        retried_io_errors=("slow down",),
+    )
+    assert disabled_with_irrelevant_limits == disabled_canonical
+    assert GPUStageRetryPolicy(
+        actor_task_retry_on_errors=[], retried_map_errors=[]
+    ) == GPUStageRetryPolicy(actor_task_retry_on_errors=False, retried_map_errors=False)
+
+    class Retryable(RuntimeError):
+        pass
+
+    retrying = GPUStageRetryPolicy(
+        actor_max_restarts=4,
+        actor_max_task_retries=2,
+        actor_task_retry_on_errors=[Retryable],
+        actor_init_retry_on_errors=True,
+        actor_init_max_retries=5,
+        retried_map_errors=["Retryable"],
+        max_map_retries=7,
+        retried_io_errors=["network"],
+    )
+    assert retrying.actor_task_retry_on_errors == (Retryable,)
+    assert retrying.retried_map_errors == ("Retryable",)
+    assert retrying.retried_io_errors == ("network",)
+    assert GPUExecutionCompatibilityKey(
+        num_gpus=0, retry_policy=retrying
+    ) != GPUExecutionCompatibilityKey(num_gpus=0, retry_policy=disabled_canonical)
+
+
+def test_range_and_complete_partition_facts_satisfy_independent_requirements():
     range_fact = PropertyFact(
         RangePartitioning(("User",), "scheme"), Evidence.USER_ASSERTED
     )
-    map_spec = GPUOperatorSpec(
-        transforms=(
-            GPUTransformSpec(
-                "map",
-                "map",
-                PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.CUDF_BATCH_STREAM,
-                creates_obligations=(obligation,),
-            ),
-            GPUTransformSpec(
-                "validate",
-                "validate",
-                PayloadKind.CUDF_BATCH_STREAM,
-                PayloadKind.CUDF_BATCH_STREAM,
-                discharges_obligations=(obligation,),
-            ),
-        ),
-        input_payload=PayloadKind.CUDF_BATCH_STREAM,
-        output_payload=PayloadKind.CUDF_BATCH_STREAM,
-        execution_requirements=GPUExecutionRequirements(
-            compatibility_key=GPUExecutionCompatibilityKey(num_gpus=0)
-        ),
-        output_properties=(range_fact,),
-        logical_provenance=("MapBatches",),
-        region_id="test-region",
+    complete_fact = PropertyFact(
+        CompletePartitionBundles(), Evidence.OPERATOR_GUARANTEE
     )
-    grouped_spec = _spec(
-        "grouped",
+
+    assert property_satisfies(range_fact, KeysColocated(("User", "Card")))
+    assert not property_satisfies(range_fact, KeysColocated(("Card", "User")))
+    assert property_satisfies(complete_fact, CompletePartitionBundles())
+    assert not property_satisfies(
+        PropertyFact(UnknownPartitioning(), Evidence.DERIVED),
+        KeysColocated(("User",)),
+    )
+
+
+def test_property_dispatch_extends_without_resolver_changes():
+    @dataclass(frozen=True)
+    class _HashPartitioning(PropertyValue):
+        keys: tuple[str, ...]
+
+    @dataclass(frozen=True)
+    class _HashColocated(PropertyRequirement):
+        keys: tuple[str, ...]
+
+    register_property_satisfaction(
+        _HashPartitioning,
+        _HashColocated,
+        lambda fact, requirement: fact.keys == requirement.keys,
+    )
+    fact = PropertyFact(_HashPartitioning(("id",)), Evidence.DERIVED)
+
+    assert property_satisfies(fact, _HashColocated(("id",)))
+    assert not property_satisfies(fact, _HashColocated(("other",)))
+
+
+def test_composition_uses_only_explicit_downstream_readvertisement():
+    range_fact = PropertyFact(
+        RangePartitioning(("User",), "scheme"), Evidence.OPERATOR_GUARANTEE
+    )
+    upstream = _spec(
+        "upstream",
         PayloadKind.CUDF_BATCH_STREAM,
-        PayloadKind.OUTPUT_BATCH_STREAM,
-        requirements=(KeysColocated(("User", "Card")),),
-        requires_resolved=True,
+        PayloadKind.CUDF_BATCH_STREAM,
+        properties=(range_fact,),
     )
-    composed = compose_gpu_operator_specs(map_spec, grouped_spec)
-    assert composed.transform_ids == ("map", "validate", "grouped")
+    passthrough_without_contract = _spec(
+        "passthrough",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+    )
+
+    composed = compose_gpu_operator_specs(upstream, passthrough_without_contract)
+    assert composed.output_properties == ()
 
 
-def test_range_prefix_satisfaction_does_not_bypass_validation_obligation():
+def test_range_validation_obligation_orders_dependent_transforms():
     obligation = RowsOwnedByRange("User", "scheme")
     range_fact = PropertyFact(
         RangePartitioning(("User",), "scheme"), Evidence.USER_ASSERTED
@@ -261,20 +369,300 @@ def test_range_prefix_satisfaction_does_not_bypass_validation_obligation():
         properties=(range_fact,),
         creates=(obligation,),
     )
-    grouped_spec = _spec(
+    validator = _spec(
+        "validate",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+        properties=(range_fact,),
+        discharges=(obligation,),
+    )
+    grouped = _spec(
         "grouped",
         PayloadKind.CUDF_BATCH_STREAM,
-        PayloadKind.OUTPUT_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
         requirements=(KeysColocated(("User", "Card")),),
         requires_resolved=True,
     )
 
+    composed = compile_gpu_region((map_spec, validator, grouped))
+    assert composed.transform_ids == ("map", "validate", "grouped")
+
+
+def test_partial_region_probe_allows_a_later_spec_to_discharge_obligation():
+    obligation = RowsOwnedByRange("User", "scheme")
+    creator = _spec(
+        "create-obligation",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+        creates=(obligation,),
+    )
+    discharger = _spec(
+        "discharge-obligation",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+        discharges=(obligation,),
+    )
+
     with pytest.raises(GPUCompositionError) as exc_info:
-        compose_gpu_operator_specs(map_spec, grouped_spec)
+        compile_gpu_region((creator,))
     assert (
         exc_info.value.reason
         is GPUCompositionErrorReason.UNRESOLVED_VALIDATION_OBLIGATION
     )
+
+    prefix = compile_gpu_region((creator,), require_resolved_output=False)
+    assert prefix.transform_ids == ("create-obligation",)
+    completed = compile_gpu_region((creator, discharger))
+    assert completed.transform_ids == (
+        "create-obligation",
+        "discharge-obligation",
+    )
+
+
+def test_gate2_marker_is_explicit_and_cannot_be_forged_halfway():
+    spec = _spec(
+        "read",
+        PayloadKind.RANGE_WORK,
+        PayloadKind.RANGE_DATA,
+        input_adapter=RANGE_WORK_ADAPTER_KEY,
+    )
+    sealed = spec.for_gate2_stage(
+        specialized_read_parallelism_resolved=True,
+        uses_terminal_output_adapter=True,
+    )
+
+    assert sealed.gate2_composed
+    assert sealed.specialized_read_parallelism_resolved
+    assert not spec.gate2_composed
+    with pytest.raises(ValueError, match="only on a gate-2-composed stage"):
+        replace(spec, specialized_read_parallelism_resolved=True)
+
+
+def test_v1_boundary_registry_exposes_only_implemented_directions():
+    assert (
+        get_gpu_boundary_adapter(
+            key=RANGE_WORK_ADAPTER_KEY,
+            direction=GPUBoundaryDirection.IMPORT,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.RANGE_WORK,
+        )
+        is not None
+    )
+    terminal = get_gpu_boundary_adapter(
+        key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
+        direction=GPUBoundaryDirection.EXPORT,
+        external_payload=PayloadKind.RAY_BLOCK_STREAM,
+        native_payload=PayloadKind.RANGE_DATA,
+    )
+    assert terminal is not None
+    for direction in (
+        GPUBoundaryDirection.IMPORT,
+        GPUBoundaryDirection.EXPORT,
+    ):
+        assert (
+            get_gpu_boundary_adapter(
+                key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+                direction=direction,
+                external_payload=PayloadKind.RAY_BLOCK_STREAM,
+                native_payload=PayloadKind.RANGE_DATA,
+            )
+            is None
+        )
+
+    spec = _spec("map", PayloadKind.RANGE_DATA, PayloadKind.RANGE_DATA)
+    assert spec.output_adapter_key == RANGE_DATA_BOUNDARY_ADAPTER_KEY
+    assert spec.terminal_output_adapter_key == RANGE_DATA_TERMINAL_ADAPTER_KEY
+    identity = RangePartitionIdentity(0, "range", 1, 1)
+    blocks = list(terminal.adapt(RangeData(identity, iter(({"value": [1]},))), None))
+    assert blocks and all(not isinstance(block, RangeData) for block in blocks)
+    assert blocks[0].column_names == ["value"]
+
+
+def test_boundary_registry_is_additive_and_direction_aware():
+    def import_value(value, _context):
+        return value
+
+    register_gpu_boundary_adapter(
+        GPUBoundaryAdapter(
+            key="test-additive-adapter-v1",
+            direction=GPUBoundaryDirection.IMPORT,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.CUDF_PARTITION,
+            adapt=import_value,
+        ),
+        replace_existing=True,
+    )
+
+    assert (
+        get_gpu_boundary_adapter(
+            key="test-additive-adapter-v1",
+            direction=GPUBoundaryDirection.IMPORT,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.CUDF_PARTITION,
+        )
+        is not None
+    )
+    assert (
+        get_gpu_boundary_adapter(
+            key="test-additive-adapter-v1",
+            direction=GPUBoundaryDirection.EXPORT,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.CUDF_PARTITION,
+        )
+        is None
+    )
+
+
+def test_driver_resolved_boundary_handlers_serialize_with_stage():
+    def passthrough(value, _context):
+        return value
+
+    key = "test-serialized-adapter-v1"
+    for direction in (
+        GPUBoundaryDirection.IMPORT,
+        GPUBoundaryDirection.EXPORT,
+    ):
+        register_gpu_boundary_adapter(
+            GPUBoundaryAdapter(
+                key=key,
+                direction=direction,
+                external_payload=PayloadKind.RAY_BLOCK_STREAM,
+                native_payload=PayloadKind.CUDF_PARTITION,
+                adapt=passthrough,
+            )
+        )
+    spec = _spec(
+        "adapter-transform",
+        PayloadKind.CUDF_PARTITION,
+        PayloadKind.CUDF_PARTITION,
+        input_adapter=key,
+        output_adapter=key,
+        config=passthrough,
+    )
+    restored = cloudpickle.loads(cloudpickle.dumps(GPURegionBlockTransform(spec)))
+    for direction in (
+        GPUBoundaryDirection.IMPORT,
+        GPUBoundaryDirection.EXPORT,
+    ):
+        unregister_gpu_boundary_adapter(
+            key=key,
+            direction=direction,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.CUDF_PARTITION,
+        )
+
+    assert restored([1, 2], None) == [1, 2]
+
+
+def test_non_range_source_composes_through_distribution_neutral_envelopes():
+    @dataclass(frozen=True)
+    class HashPartitionIdentity(PartitionIdentity):
+        bucket: int
+        scheme_id: str
+
+    @dataclass(frozen=True)
+    class CustomRangeWork:
+        partition: PartitionIdentity
+        values: tuple[int, ...]
+
+    exported_partitions = []
+
+    def import_custom_work(values, _context):
+        (work,) = tuple(values)
+        assert isinstance(work, CustomRangeWork)
+        return work
+
+    def export_range_data(value, _context):
+        assert isinstance(value, RangeData)
+        exported_partitions.append(value.partition)
+        return value.value
+
+    def read_custom_range(work, _context):
+        # No ParquetRangeWork is fabricated: the provider-owned work descriptor
+        # is consumed only by its own source transform.
+        return RangeData(work.partition, iter(work.values))
+
+    def double_range(value, _context):
+        return RangeData(value.partition, (item * 2 for item in value.value))
+
+    def group_range(value, _context):
+        values = tuple(value.value)
+        return GroupedRangeData(value.partition, values, (0, len(values)))
+
+    def emit_grouped_range(value, _context):
+        assert isinstance(value, GroupedRangeData)
+        return RangeData(value.partition, iter(value.frame))
+
+    source_key = "test-custom-range-source-v1"
+    data_key = "test-custom-range-data-v1"
+    adapters = (
+        GPUBoundaryAdapter(
+            key=source_key,
+            direction=GPUBoundaryDirection.IMPORT,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.RANGE_WORK,
+            adapt=import_custom_work,
+        ),
+        GPUBoundaryAdapter(
+            key=data_key,
+            direction=GPUBoundaryDirection.EXPORT,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.RANGE_DATA,
+            adapt=export_range_data,
+        ),
+    )
+    for adapter in adapters:
+        register_gpu_boundary_adapter(adapter)
+    try:
+        source = _spec(
+            "custom-source",
+            PayloadKind.RANGE_WORK,
+            PayloadKind.RANGE_DATA,
+            input_adapter=source_key,
+            output_adapter=data_key,
+            config=read_custom_range,
+        )
+        unary = _spec(
+            "custom-unary",
+            PayloadKind.RANGE_DATA,
+            PayloadKind.RANGE_DATA,
+            input_adapter=data_key,
+            output_adapter=data_key,
+            config=double_range,
+        )
+        grouping = _spec(
+            "custom-group",
+            PayloadKind.RANGE_DATA,
+            PayloadKind.GROUPED_RANGE_DATA,
+            input_adapter=data_key,
+            output_adapter=data_key,
+            config=group_range,
+        )
+        grouped_map = _spec(
+            "custom-group-map",
+            PayloadKind.GROUPED_RANGE_DATA,
+            PayloadKind.RANGE_DATA,
+            input_adapter=data_key,
+            output_adapter=data_key,
+            config=emit_grouped_range,
+        )
+        stage = compile_gpu_region((source, unary, grouping, grouped_map))
+        identity = HashPartitionIdentity(7, "hash-scheme")
+        work = CustomRangeWork(
+            identity,
+            (10, 12),
+        )
+
+        assert list(GPURegionBlockTransform(stage)([work], None)) == [20, 24]
+        assert exported_partitions == [identity]
+    finally:
+        for adapter in adapters:
+            unregister_gpu_boundary_adapter(
+                key=adapter.key,
+                direction=adapter.direction,
+                external_payload=adapter.external_payload,
+                native_payload=adapter.native_payload,
+            )
 
 
 def test_generic_region_worker_runs_synthetic_transforms_in_order():
@@ -285,24 +673,30 @@ def test_generic_region_worker_runs_synthetic_transforms_in_order():
         return (value * 2 for value in values)
 
     spec = GPUOperatorSpec(
+        spec_instance_id="synthetic",
         transforms=(
             GPUTransformSpec(
-                "add",
+                "synthetic/0/add",
                 "synthetic_add",
                 PayloadKind.RAY_BLOCK_STREAM,
                 PayloadKind.RAY_BLOCK_STREAM,
                 config=add_one,
             ),
             GPUTransformSpec(
-                "double",
+                "synthetic/1/double",
                 "synthetic_double",
                 PayloadKind.RAY_BLOCK_STREAM,
                 PayloadKind.RAY_BLOCK_STREAM,
                 config=double,
             ),
         ),
-        input_payload=PayloadKind.RAY_BLOCK_STREAM,
-        output_payload=PayloadKind.RAY_BLOCK_STREAM,
+        external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
+        external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
+        native_input_payload=PayloadKind.RAY_BLOCK_STREAM,
+        native_output_payload=PayloadKind.RAY_BLOCK_STREAM,
+        input_adapter_key="synthetic-v1",
+        output_adapter_key="synthetic-v1",
+        terminal_output_adapter_key="synthetic-terminal-v1",
         execution_requirements=GPUExecutionRequirements(
             compatibility_key=GPUExecutionCompatibilityKey(num_gpus=0)
         ),

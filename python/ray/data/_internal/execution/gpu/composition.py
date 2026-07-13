@@ -6,7 +6,6 @@ from enum import Enum
 from typing import Iterable, List, Tuple
 
 from ray.data._internal.execution.gpu.operator_spec import (
-    GPUBoundaryPolicy,
     GPUOperatorSpec,
     GPUTransformSpec,
 )
@@ -20,9 +19,10 @@ class GPUCompositionErrorReason(str, Enum):
     EXECUTION_INCOMPATIBLE = "EXECUTION_INCOMPATIBLE"
     INPUT_REQUIREMENTS_UNSATISFIED = "INPUT_REQUIREMENTS_UNSATISFIED"
     PAYLOAD_INCOMPATIBLE = "PAYLOAD_INCOMPATIBLE"
-    PHYSICAL_BOUNDARY_REQUIRED = "PHYSICAL_BOUNDARY_REQUIRED"
+    ADAPTER_INCOMPATIBLE = "ADAPTER_INCOMPATIBLE"
     UNRESOLVED_VALIDATION_OBLIGATION = "UNRESOLVED_VALIDATION_OBLIGATION"
     DUPLICATE_TRANSFORM_ID = "DUPLICATE_TRANSFORM_ID"
+    SEALED_GATE2_STAGE = "SEALED_GATE2_STAGE"
 
 
 class GPUCompositionError(ValueError):
@@ -35,7 +35,7 @@ class GPUCompositionError(ValueError):
 def unresolved_validation_obligations(
     transforms: Iterable[GPUTransformSpec],
 ) -> Tuple[ValidationObligation, ...]:
-    """Validate obligation ordering and return obligations left at region output."""
+    """Validate obligation ordering and return obligations left at stage output."""
 
     pending: List[ValidationObligation] = []
     for transform in transforms:
@@ -52,11 +52,27 @@ def unresolved_validation_obligations(
     return tuple(pending)
 
 
+def _composed_spec_instance_id(transforms: Tuple[GPUTransformSpec, ...]) -> str:
+    # Derived only from the flattened ordered transform sequence, so pairwise
+    # composition produces the same identifier under either association.
+    return (
+        "gpu-stage["
+        + ",".join(transform.transform_id for transform in transforms)
+        + "]"
+    )
+
+
 def compose_gpu_operator_specs(
     upstream: GPUOperatorSpec,
     downstream: GPUOperatorSpec,
 ) -> GPUOperatorSpec:
     """Compose two adjacent specifications without consulting Ray runtime state."""
+
+    if upstream.gate2_composed or downstream.gate2_composed:
+        raise GPUCompositionError(
+            GPUCompositionErrorReason.SEALED_GATE2_STAGE,
+            "a gate-2-composed stage is atomic and cannot be re-composed",
+        )
 
     if (
         upstream.execution_requirements.backend_name
@@ -65,34 +81,27 @@ def compose_gpu_operator_specs(
     ):
         raise GPUCompositionError(
             GPUCompositionErrorReason.EXECUTION_INCOMPATIBLE,
-            "GPU execution compatibility keys differ",
-        )
-    if (
-        upstream.region_id is not None
-        and downstream.region_id is not None
-        and upstream.region_id != downstream.region_id
-    ):
-        raise GPUCompositionError(
-            GPUCompositionErrorReason.EXECUTION_INCOMPATIBLE,
-            f"region ids differ: {upstream.region_id!r} != {downstream.region_id!r}",
-        )
-    expected_upstream = upstream.required_logical_provenance
-    expected_downstream = downstream.required_logical_provenance
-    if (
-        expected_upstream
-        and expected_downstream
-        and expected_upstream != expected_downstream
-    ):
-        raise GPUCompositionError(
-            GPUCompositionErrorReason.EXECUTION_INCOMPATIBLE,
-            "required logical provenance differs",
+            "GPU execution or retry compatibility keys differ",
         )
 
-    if upstream.output_payload != downstream.input_payload:
+    if upstream.native_output_payload != downstream.native_input_payload:
         raise GPUCompositionError(
             GPUCompositionErrorReason.PAYLOAD_INCOMPATIBLE,
-            f"{upstream.output_payload.value} cannot feed "
-            f"{downstream.input_payload.value}",
+            f"{upstream.native_output_payload.value} cannot feed "
+            f"{downstream.native_input_payload.value}",
+        )
+
+    if (
+        upstream.external_output_payload != downstream.external_input_payload
+        or upstream.output_adapter_key != downstream.input_adapter_key
+    ):
+        raise GPUCompositionError(
+            GPUCompositionErrorReason.ADAPTER_INCOMPATIBLE,
+            "declared intermediate boundary adapters differ: "
+            f"{upstream.external_output_payload.value}/"
+            f"{upstream.output_adapter_key!r} -> "
+            f"{downstream.external_input_payload.value}/"
+            f"{downstream.input_adapter_key!r}",
         )
 
     if not requirements_satisfied(
@@ -102,15 +111,6 @@ def compose_gpu_operator_specs(
             GPUCompositionErrorReason.INPUT_REQUIREMENTS_UNSATISFIED,
             f"facts={upstream.output_properties!r}, "
             f"requirements={downstream.input_requirements!r}",
-        )
-
-    if (
-        upstream.output_boundary is GPUBoundaryPolicy.REQUIRED
-        or downstream.input_boundary is GPUBoundaryPolicy.REQUIRED
-    ):
-        raise GPUCompositionError(
-            GPUCompositionErrorReason.PHYSICAL_BOUNDARY_REQUIRED,
-            "an intermediate physical boundary is required",
         )
 
     transforms = upstream.transforms + downstream.transforms
@@ -126,28 +126,30 @@ def compose_gpu_operator_specs(
             f"duplicate transform ids: {duplicates!r}",
         )
 
-    # This scans the complete ordered transform list so an obligation created in
-    # one node must be discharged before a dependent transform in a later node.
+    # Scan the complete ordered list so an obligation created in one spec must
+    # be discharged before a dependent transform in a later spec.
     unresolved_validation_obligations(transforms)
 
     return GPUOperatorSpec(
+        spec_instance_id=_composed_spec_instance_id(transforms),
         transforms=transforms,
-        input_payload=upstream.input_payload,
-        output_payload=downstream.output_payload,
+        external_input_payload=upstream.external_input_payload,
+        external_output_payload=downstream.external_output_payload,
+        native_input_payload=upstream.native_input_payload,
+        native_output_payload=downstream.native_output_payload,
+        input_adapter_key=upstream.input_adapter_key,
+        # Composition compatibility is intentionally based on the preserving
+        # boundary declaration.  Terminal materialization is selected only
+        # when gate 2 seals the final component stage.
+        output_adapter_key=downstream.output_adapter_key,
+        terminal_output_adapter_key=downstream.terminal_output_adapter_key,
         execution_requirements=upstream.execution_requirements,
         input_requirements=upstream.input_requirements,
+        # Property transfer is always explicit.  Composition never smuggles an
+        # upstream fact through a downstream operator that did not advertise it.
         output_properties=downstream.output_properties,
-        input_boundary=upstream.input_boundary,
-        output_boundary=downstream.output_boundary,
         logical_provenance=(
             upstream.logical_provenance + downstream.logical_provenance
         ),
-        required_logical_provenance=(
-            expected_upstream or expected_downstream
-        ),
-        region_id=upstream.region_id or downstream.region_id,
-        requires_complete_fusion=(
-            upstream.requires_complete_fusion
-            or downstream.requires_complete_fusion
-        ),
+        uses_terminal_output_adapter=downstream.uses_terminal_output_adapter,
     )

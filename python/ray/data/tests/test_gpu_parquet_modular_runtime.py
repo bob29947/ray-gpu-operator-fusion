@@ -6,8 +6,8 @@ from ray.data._internal.execution.gpu.parquet_types import (
     ParquetRangeWork,
     ParquetRowGroup,
     ParquetSourceIdentity,
-    RangeData,
 )
+from ray.data._internal.execution.gpu.payloads import RangeData, RangePartitionIdentity
 from ray.data._internal.execution.gpu.transforms.boundary import (
     decode_one_range_work,
     deserialize_range_work,
@@ -16,6 +16,10 @@ from ray.data._internal.execution.gpu.transforms.boundary import (
 from ray.data._internal.execution.gpu.transforms.map_batches import (
     MapBatchesConfig,
     MapBatchesRuntime,
+)
+from ray.data._internal.execution.gpu.transforms.parquet_read import (
+    ReadParquetRangeConfig,
+    ReadParquetRangeRuntime,
 )
 from ray.data._internal.planner.parquet_cudf_range_planner import (
     build_range_plan,
@@ -166,6 +170,86 @@ def test_zero_copy_false_performs_deep_copy_before_udf():
         upper=5,
         files=(ParquetFileWork("file", _identity(), (0,)),),
     )
-    result = runtime.apply(RangeData(work, iter((_FakeFrame(),))), None)
+    result = runtime.apply(RangeData(work.partition, iter((_FakeFrame(),))), None)
     assert list(result.value)
     assert _FakeFrame.copy_calls == [True]
+
+
+class _RetryingCudf:
+    def __init__(self, failures):
+        self._failures = iter(failures)
+        self.calls = 0
+
+    def read_parquet(self, path, **kwargs):
+        import pandas as pd
+
+        del path, kwargs
+        self.calls += 1
+        error = next(self._failures, None)
+        if error is not None:
+            raise error
+        return pd.DataFrame({"user": [2], "value": [10]})
+
+
+class _ReadContext:
+    def __init__(self, cudf):
+        self.cudf = cudf
+
+    def ensure_cudf(self, **kwargs):
+        del kwargs
+        return self
+
+
+def _read_runtime(cudf, retried_io_errors):
+    runtime = ReadParquetRangeRuntime(
+        ReadParquetRangeConfig(
+            source_kind="local",
+            region=None,
+            projection=("user", "value"),
+            range_key="user",
+            retried_io_errors=tuple(retried_io_errors),
+        ),
+        _ReadContext(cudf),
+    )
+    runtime._verify_identity = lambda _file: None
+    return runtime
+
+
+def _read_work():
+    return ParquetRangeWork(
+        range_id=0,
+        scheme_id="scheme",
+        lower=1,
+        upper=5,
+        files=(ParquetFileWork("file", _identity(), (0,)),),
+    )
+
+
+def test_parquet_row_group_read_honors_retried_io_errors(monkeypatch):
+    from ray.data._internal import util
+
+    monkeypatch.setattr(util.time, "sleep", lambda _seconds: None)
+    cudf = _RetryingCudf([OSError("temporary network failure")])
+
+    output = _read_runtime(cudf, ("temporary network",)).apply(_read_work(), None)
+
+    assert output.partition == RangePartitionIdentity(0, "scheme", 1, 5)
+    assert not hasattr(output, "work")
+    assert [frame.to_dict("records") for frame in output.value] == [
+        [{"user": 2, "value": 10}]
+    ]
+    assert cudf.calls == 2
+
+
+def test_parquet_row_group_read_does_not_retry_unmatched_error(monkeypatch):
+    from ray.data._internal import util
+
+    monkeypatch.setattr(util.time, "sleep", lambda _seconds: None)
+    cudf = _RetryingCudf([OSError("permanent failure")])
+    output = _read_runtime(cudf, ("temporary network",)).apply(_read_work(), None)
+
+    import pytest
+
+    with pytest.raises(OSError, match="permanent failure"):
+        list(output.value)
+    assert cudf.calls == 1

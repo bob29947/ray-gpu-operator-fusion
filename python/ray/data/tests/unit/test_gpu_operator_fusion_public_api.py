@@ -62,6 +62,11 @@ def test_udf_properties_is_minimal_frozen_public_contract():
         properties.preserves_partitioning = False
 
 
+def test_udf_properties_rejects_non_boolean_preservation_flag():
+    with pytest.raises(TypeError, match="preserves_partitioning must be a bool"):
+        UDFProperties(preserves_partitioning=1)
+
+
 @pytest.mark.parametrize("properties", [None, UDFProperties(), UDFProperties(True)])
 def test_map_batches_plumbs_udf_properties(source_dataset, properties):
     dataset = Dataset.map_batches(
@@ -85,12 +90,23 @@ def test_map_batches_legacy_call_defaults_to_no_udf_properties(source_dataset):
     assert op.udf_properties is None
 
 
-def test_map_group_partitions_builds_logical_operator(source_dataset):
+def test_map_batches_rejects_invalid_udf_properties(source_dataset):
+    with pytest.raises(TypeError, match="udf_properties must be"):
+        Dataset.map_batches(
+            source_dataset,
+            identity,
+            batch_size=None,
+            udf_properties="invalid",
+        )
+
+
+@pytest.mark.parametrize("properties", [None, UDFProperties(), UDFProperties(True)])
+def test_map_group_partitions_builds_logical_operator(source_dataset, properties):
     dataset = GroupedData(
         source_dataset,
         ["User", "Card"],
         num_partitions=8,
-    ).map_group_partitions(identity)
+    ).map_group_partitions(identity, udf_properties=properties)
 
     op = dataset._logical_plan.dag
     assert isinstance(op, MapGroupPartitions)
@@ -98,8 +114,29 @@ def test_map_group_partitions_builds_logical_operator(source_dataset):
     assert op.key == ["User", "Card"]
     assert op.num_partitions == 8
     assert op.fn is identity
+    assert op.udf_properties is properties
     assert op.num_outputs == 8
     assert op.name == "MapGroupPartitions"
+
+
+def test_map_group_partitions_legacy_call_defaults_to_no_udf_properties(
+    source_dataset,
+):
+    dataset = GroupedData(
+        source_dataset,
+        "User",
+        num_partitions=None,
+    ).map_group_partitions(identity)
+
+    op = dataset._logical_plan.dag
+    assert isinstance(op, MapGroupPartitions)
+    assert op.udf_properties is None
+
+
+def test_map_group_partitions_rejects_invalid_udf_properties(source_dataset):
+    grouped = GroupedData(source_dataset, "User", num_partitions=None)
+    with pytest.raises(TypeError, match="udf_properties must be"):
+        grouped.map_group_partitions(identity, udf_properties="invalid")
 
 
 def test_map_group_partitions_contract_is_documented():
@@ -120,9 +157,7 @@ def test_map_group_partitions_contract_is_documented():
         (["User", 1], "non-empty string"),
     ],
 )
-def test_map_group_partitions_rejects_invalid_keys(
-    source_dataset, key, error
-):
+def test_map_group_partitions_rejects_invalid_keys(source_dataset, key, error):
     grouped = GroupedData(source_dataset, key, num_partitions=None)
     with pytest.raises(ValueError, match=error):
         grouped.map_group_partitions(identity)

@@ -55,7 +55,7 @@ def _create_cudf_transform_runtime(
             MapGroupPartitionsRuntime,
         )
 
-        return MapGroupPartitionsRuntime(config)
+        return MapGroupPartitionsRuntime(config, context)
     raise ValueError(f"Unknown GPU transform kind: {kind!r}")
 
 

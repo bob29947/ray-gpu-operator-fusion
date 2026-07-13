@@ -6,6 +6,8 @@ import pytest
 
 import ray
 from ray.data import ActorPoolStrategy, UDFProperties
+from ray.data._internal.logical.optimizers import get_physical_ruleset
+from ray.data._internal.logical.rules import FuseGPUOperators
 from ray.data.tests.conftest import *  # noqa: F403
 
 pytest.importorskip("cudf")
@@ -76,7 +78,15 @@ def test_parquet_map_group_partitions_executes_one_fused_gpu_operator(
         .map_group_partitions(identity_partition)
     )
 
-    rows = output.take_all()
+    # Gate 2 must already have built a valid executable stage.  Exercise it with
+    # the optional physical GPU fusion rule absent, rather than merely checking
+    # the pre-optimizer plan structure.
+    physical_rules = get_physical_ruleset()
+    physical_rules.remove(FuseGPUOperators)
+    try:
+        rows = output.take_all()
+    finally:
+        physical_rules.add(FuseGPUOperators)
     assert len({row.pop("tokenizer_instance") for row in rows}) == 1
     rows.sort(key=lambda row: (row["User"], row["Card"]))
     assert rows == [
@@ -89,3 +99,5 @@ def test_parquet_map_group_partitions_executes_one_fused_gpu_operator(
     assert "GPU[read_parquet_range,map_batches,validate_range_ownership," in stats
     assert "sort_partition,build_group_boundaries,map_group_partitions]" in stats
     assert "Repartition" not in stats
+    assert "H2D" not in stats
+    assert "D2H" not in stats

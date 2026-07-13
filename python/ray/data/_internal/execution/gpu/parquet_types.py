@@ -8,7 +8,8 @@ recognizer instead.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+
+from ray.data._internal.execution.gpu.payloads import RangePartitionIdentity
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,17 @@ class ParquetRangeWork:
         if not self.files:
             raise ValueError("Parquet range work must contain at least one file")
 
+    @property
+    def partition(self) -> RangePartitionIdentity:
+        """Return the source-independent identity emitted with decoded data."""
+
+        return RangePartitionIdentity(
+            partition_id=self.range_id,
+            scheme_id=self.scheme_id,
+            lower=self.lower,
+            upper=self.upper,
+        )
+
 
 @dataclass(frozen=True)
 class ParquetFooterSummary:
@@ -101,13 +113,11 @@ class ParquetRangePlan:
     footer_elapsed_s: float
 
 
-@dataclass(frozen=True, eq=False)
-class RangeData:
-    """Actor-local value that preserves range identity across transforms.
-
-    ``value`` may be a generator or a mutable cuDF object and is therefore
-    deliberately excluded from structural equality.
-    """
-
-    work: ParquetRangeWork
-    value: Any
+__all__ = [
+    "ParquetFileWork",
+    "ParquetFooterSummary",
+    "ParquetRangePlan",
+    "ParquetRangeWork",
+    "ParquetRowGroup",
+    "ParquetSourceIdentity",
+]

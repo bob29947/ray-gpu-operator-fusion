@@ -350,6 +350,34 @@ py_test(
 )
 
 py_test(
+    name = "test_gpu_actor_pool_atomicity",
+    size = "medium",
+    srcs = ["tests/test_gpu_actor_pool_atomicity.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_gpu_actor_pool_retries",
+    size = "medium",
+    srcs = ["tests/test_gpu_actor_pool_retries.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
     name = "test_gpu_operator_fusion_parquet",
     size = "medium",
     srcs = ["tests/test_gpu_operator_fusion_parquet.py"],

@@ -8,9 +8,14 @@ import numbers
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator
 
-from ray.data._internal.execution.gpu.parquet_types import RangeData
+from ray.data._internal.execution.gpu.payloads import RangeData
 from ray.data._internal.execution.gpu.transforms._runtime_support import (
     CudfRuntimeContext,
+)
+from ray.data._internal.execution.gpu.transforms._user_code import (
+    invoke_user_code,
+    iterate_user_code,
+    raise_user_code_exception,
 )
 
 MAP_BATCHES_KIND = "map_batches"
@@ -135,7 +140,8 @@ class MapBatchesRuntime:
 
     def initialize(self) -> None:
         self._context.ensure_cudf()
-        self._udf = self._config.udf_cls(
+        self._udf = invoke_user_code(
+            self._config.udf_cls,
             *self._config.fn_constructor_args,
             **dict(self._config.fn_constructor_kwargs),
         )
@@ -144,25 +150,29 @@ class MapBatchesRuntime:
         cudf = self._context.cudf
         for raw in rebatched_frames(frames, int(self._config.batch_size), cudf):
             udf_input = raw if self._config.zero_copy_batch else raw.copy(deep=True)
-            result = self._udf(
+            result = invoke_user_code(
+                self._udf,
                 udf_input,
                 *self._config.fn_args,
                 **dict(self._config.fn_kwargs),
             )
-            for output in one_or_generator(result):
-                if not isinstance(output, cudf.DataFrame):
-                    raise TypeError(
-                        "The GPU map_batches UDF must return cuDF DataFrames"
-                    )
-                output = output.reset_index(drop=True)
-                if len(output):
-                    yield output
+            for output in iterate_user_code(one_or_generator(result)):
+                try:
+                    if not isinstance(output, cudf.DataFrame):
+                        raise TypeError(
+                            "The GPU map_batches UDF must return cuDF DataFrames"
+                        )
+                    output = output.reset_index(drop=True)
+                    if len(output):
+                        yield output
+                except Exception as error:
+                    raise_user_code_exception(error)
 
     def apply(self, value: Any, task_context: Any) -> RangeData:
         del task_context
         if not isinstance(value, RangeData):
             raise TypeError("map_batches expected actor-local RangeData")
-        return RangeData(value.work, self._apply_frames(value.value))
+        return RangeData(value.partition, self._apply_frames(value.value))
 
 
 class ValidateRangeOwnershipRuntime:
@@ -178,26 +188,31 @@ class ValidateRangeOwnershipRuntime:
 
     def _validate(self, value: RangeData) -> Iterator[Any]:
         for frame in value.value:
-            if not len(frame):
-                continue
-            if any(key not in frame for key in self._config.group_keys):
-                raise ValueError("The GPU map_batches UDF removed a group key")
-            range_values = frame[self._config.range_key]
-            range_owned = not bool(range_values.isnull().any()) and bool(
-                (
-                    (range_values >= value.work.lower)
-                    & (range_values <= value.work.upper)
-                ).all()
-            )
-            if not range_owned:
-                raise ValueError(
-                    "The GPU map_batches UDF produced a leading group key "
-                    "outside its assigned range"
+            # Iterator advancement stays outside this try block so upstream
+            # I/O/system failures are not mislabeled as user contract errors.
+            try:
+                if not len(frame):
+                    continue
+                if any(key not in frame for key in self._config.group_keys):
+                    raise ValueError("The GPU map_batches UDF removed a group key")
+                range_values = frame[self._config.range_key]
+                range_owned = not bool(range_values.isnull().any()) and bool(
+                    (
+                        (range_values >= value.partition.lower)
+                        & (range_values <= value.partition.upper)
+                    ).all()
                 )
+                if not range_owned:
+                    raise ValueError(
+                        "The GPU map_batches UDF produced a leading group key "
+                        "outside its assigned range"
+                    )
+            except Exception as error:
+                raise_user_code_exception(error)
             yield frame
 
     def apply(self, value: Any, task_context: Any) -> RangeData:
         del task_context
         if not isinstance(value, RangeData):
             raise TypeError("range validation expected actor-local RangeData")
-        return RangeData(value.work, self._validate(value))
+        return RangeData(value.partition, self._validate(value))

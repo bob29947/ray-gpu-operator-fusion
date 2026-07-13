@@ -11,12 +11,11 @@ from ray.data._internal.execution.gpu.parquet_types import (
     ParquetFileWork,
     ParquetRangeWork,
     ParquetSourceIdentity,
-    RangeData,
 )
+from ray.data._internal.execution.gpu.payloads import RangeData
 from ray.data._internal.execution.gpu.transforms._runtime_support import (
     CudfRuntimeContext,
 )
-from ray.data._internal.execution.gpu.transforms.boundary import decode_one_range_work
 
 READ_PARQUET_RANGE_KIND = "read_parquet_range"
 
@@ -151,16 +150,18 @@ class ReadParquetRangeRuntime:
                     self._verify_identity(file)
                     return (frame,)
 
-                if self._config.source_kind == "s3":
-                    frame = tuple(
-                        iterate_with_retry(
-                            read_chunk,
-                            "read a Parquet row-group chunk with KvikIO",
-                            match=list(self._config.retried_io_errors),
-                        )
-                    )[0]
-                else:
-                    frame = next(iter(read_chunk()))
+                description = (
+                    "read a Parquet row-group chunk with KvikIO"
+                    if self._config.source_kind == "s3"
+                    else "read a Parquet row-group chunk"
+                )
+                frame = next(
+                    iterate_with_retry(
+                        read_chunk,
+                        description,
+                        match=list(self._config.retried_io_errors),
+                    )
+                )
                 frame = frame[
                     (frame[self._config.range_key] >= work.lower)
                     & (frame[self._config.range_key] <= work.upper)
@@ -170,7 +171,9 @@ class ReadParquetRangeRuntime:
 
     def apply(self, value: Any, task_context: Any) -> RangeData:
         del task_context
-        work = decode_one_range_work(value)
+        if not isinstance(value, ParquetRangeWork):
+            raise TypeError("read_parquet_range expected native ParquetRangeWork")
+        work = value
         if self._config.source_kind == "s3":
             self._context.refresh_s3_for_task()
-        return RangeData(work, self._read_frames(work))
+        return RangeData(work.partition, self._read_frames(work))

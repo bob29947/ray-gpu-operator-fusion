@@ -251,6 +251,10 @@ class MapBatches(AbstractUDFMap):
 
     def __post_init__(self):
         assert len(self.input_dependencies) == 1, len(self.input_dependencies)
+        if self.udf_properties is not None and not isinstance(
+            self.udf_properties, UDFProperties
+        ):
+            raise TypeError("udf_properties must be a UDFProperties instance or None")
         if self.compute is None:
             object.__setattr__(self, "compute", TaskPoolStrategy())
         object.__setattr__(

@@ -3,6 +3,7 @@ import math
 from typing import Optional, Tuple, Union
 
 from ray import available_resources as ray_available_resources
+from ray.data._internal.execution.gpu.operator import GPUOperator
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.logical.interfaces import PhysicalPlan, Rule
@@ -99,13 +100,14 @@ class SetReadParallelismRule(Rule):
     """
 
     @classmethod
-    def dependents(cls):
-        # Keep read specialization ahead of stock operator fusion.  The GPU rule
-        # declares this rule as its dependent, forming the physical rule chain:
-        # inherit target size -> GPU fusion -> read parallelism -> stock fusion.
-        from ray.data._internal.logical.rules.operator_fusion import FuseOperators
+    def dependencies(cls):
+        # Resolve or explicitly skip Read parallelism after target-size
+        # inheritance and before optional GPU fusion.
+        from ray.data._internal.logical.rules.inherit_target_max_block_size import (
+            InheritTargetMaxBlockSizeRule,
+        )
 
-        return [FuseOperators]
+        return [InheritTargetMaxBlockSizeRule]
 
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
         ops = [plan.dag]
@@ -113,6 +115,14 @@ class SetReadParallelismRule(Rule):
         while len(ops) > 0:
             op = ops.pop(0)
             if isinstance(op, InputDataBuffer):
+                continue
+            if (
+                isinstance(op, GPUOperator)
+                and op.gpu_operator_spec.specialized_read_parallelism_resolved
+            ):
+                # Gate 2 owns the range count and descriptor bundles.  Stock
+                # Read splitting must not reinterpret that specialized plan.
+                ops += op.input_dependencies
                 continue
             logical_op = plan.op_map[op]
             if isinstance(logical_op, Read):

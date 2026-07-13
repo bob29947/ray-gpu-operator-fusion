@@ -5,26 +5,32 @@ import pytest
 
 from ray.data.context import DataContext
 from ray.data._internal.execution.gpu import (
+    GPUBoundaryAdapter,
+    GPUBoundaryDirection,
     GPUExecutionCompatibilityKey,
     GPUExecutionRequirements,
-    GPUBoundaryPolicy,
     GPUOperator,
     GPUOperatorCreationOptions,
     GPUOperatorSpec,
+    GPUStageRetryPolicy,
     GPUTransformSpec,
     PayloadKind,
+    RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    RANGE_DATA_TERMINAL_ADAPTER_KEY,
+    RANGE_WORK_ADAPTER_KEY,
+    compile_gpu_region,
     compose_gpu_operator_specs,
     create_gpu_operator,
     register_gpu_operator_factory,
+    register_gpu_boundary_adapter,
+    unregister_gpu_boundary_adapter,
 )
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.logical.interfaces import PhysicalPlan
 from ray.data._internal.logical.optimizers import get_physical_ruleset
-from ray.data._internal.logical.rules import (
-    FuseGPUOperators,
-    GPURequiredFusionError,
-)
+from ray.data._internal.logical.rules import FuseGPUOperators
+from ray.exceptions import RaySystemError
 
 
 def _identity(value, _context):
@@ -55,53 +61,76 @@ class _FakeSessionFactory:
         return spec.execution_requirements.backend_name == "fake_session"
 
     def create(self, spec, input_op, data_context, creation_options=None):
-        return _FakeSessionGPUOperator(
-            spec, input_op, data_context, creation_options
+        return _FakeSessionGPUOperator(spec, input_op, data_context, creation_options)
+
+
+class _SingleSpecFactory(_FakeSessionFactory):
+    def supports(self, spec):
+        return (
+            spec.execution_requirements.backend_name == "single_spec"
+            and len(spec.transforms) == 1
         )
+
+
+def _register_fake_factory():
+    register_gpu_operator_factory(
+        "fake_session", _FakeSessionFactory(), replace_existing=True
+    )
 
 
 def _spec(
     transform_id,
-    input_payload,
-    output_payload,
-    provenance,
+    native_input,
+    native_output,
     *,
-    complete=False,
+    backend="fake_session",
+    key=None,
+    input_adapter=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    output_adapter=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    terminal_output_adapter=RANGE_DATA_TERMINAL_ADAPTER_KEY,
 ):
-    required = ("Read", "MapBatches", "MapGroupPartitions") if complete else ()
+    if key is None:
+        key = GPUExecutionCompatibilityKey(
+            worker_lifecycle=("session" if backend == "fake_session" else "actor_pool"),
+            num_gpus=0,
+        )
     return GPUOperatorSpec(
+        spec_instance_id=transform_id,
         transforms=(
             GPUTransformSpec(
                 transform_id,
-                transform_id,
-                input_payload,
-                output_payload,
+                transform_id.rsplit("/", 1)[-1],
+                native_input,
+                native_output,
                 config=_identity,
             ),
         ),
-        input_payload=input_payload,
-        output_payload=output_payload,
+        external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
+        external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
+        native_input_payload=native_input,
+        native_output_payload=native_output,
+        input_adapter_key=input_adapter,
+        output_adapter_key=output_adapter,
+        terminal_output_adapter_key=terminal_output_adapter,
         execution_requirements=GPUExecutionRequirements(
-            compatibility_key=GPUExecutionCompatibilityKey(num_gpus=0)
+            backend_name=backend,
+            compatibility_key=key,
         ),
-        logical_provenance=(provenance,),
-        required_logical_provenance=required,
-        region_id="region",
-        requires_complete_fusion=complete,
+        logical_provenance=(transform_id,),
     )
 
 
-def _three_node_plan(*, complete=False):
+def _three_node_plan():
+    _register_fake_factory()
     context = DataContext.get_current().copy()
     context.enable_gpu_operator_fusion = True
     source = InputDataBuffer(context, input_data=[])
     read = create_gpu_operator(
         _spec(
-            "read",
+            "read/0/read",
             PayloadKind.RANGE_WORK,
             PayloadKind.CUDF_BATCH_STREAM,
-            "Read",
-            complete=complete,
+            input_adapter=RANGE_WORK_ADAPTER_KEY,
         ),
         source,
         context,
@@ -109,22 +138,18 @@ def _three_node_plan(*, complete=False):
     )
     mapped = create_gpu_operator(
         _spec(
-            "map",
+            "map/0/map",
             PayloadKind.CUDF_BATCH_STREAM,
             PayloadKind.CUDF_BATCH_STREAM,
-            "MapBatches",
-            complete=complete,
         ),
         read,
         context,
     )
     grouped = create_gpu_operator(
         _spec(
-            "group",
+            "group/0/group",
             PayloadKind.CUDF_BATCH_STREAM,
-            PayloadKind.OUTPUT_BATCH_STREAM,
-            "MapGroupPartitions",
-            complete=complete,
+            PayloadKind.CUDF_BATCH_STREAM,
         ),
         mapped,
         context,
@@ -140,12 +165,17 @@ def _three_node_plan(*, complete=False):
     )
 
 
-def test_gpu_rule_fuses_maximal_chain_and_rewrites_op_map_idempotently():
+def test_gpu_rule_fuses_optional_chain_and_rewrites_op_map_idempotently():
     plan = _three_node_plan()
     result = FuseGPUOperators().apply(plan)
 
     assert isinstance(result.dag, GPUOperator)
-    assert result.dag.gpu_operator_spec.transform_ids == ("read", "map", "group")
+    assert result.dag.gpu_operator_spec.transform_ids == (
+        "read/0/read",
+        "map/0/map",
+        "group/0/group",
+    )
+    assert result.dag.gpu_creation_options.name == "GPU[read,map,group]"
     assert len(result.dag.input_dependencies) == 1
     assert isinstance(result.dag.input_dependencies[0], InputDataBuffer)
     assert set(result.op_map) == {result.dag.input_dependencies[0], result.dag}
@@ -158,18 +188,170 @@ def test_gpu_rule_fuses_maximal_chain_and_rewrites_op_map_idempotently():
     )
 
 
+def test_gate2_composed_stage_is_atomic_on_both_edges():
+    _register_fake_factory()
+    context = DataContext.get_current().copy()
+    context.enable_gpu_operator_fusion = True
+    source = InputDataBuffer(context, input_data=[])
+    read = _spec(
+        "read/0/read",
+        PayloadKind.RANGE_WORK,
+        PayloadKind.CUDF_BATCH_STREAM,
+        input_adapter=RANGE_WORK_ADAPTER_KEY,
+    )
+    group = _spec(
+        "group/0/group",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+    )
+    sealed_spec = compile_gpu_region((read, group)).for_gate2_stage(
+        specialized_read_parallelism_resolved=True,
+        uses_terminal_output_adapter=True,
+    )
+    sealed = create_gpu_operator(sealed_spec, source, context)
+    adjacent = create_gpu_operator(
+        _spec(
+            "adjacent/0/map",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+        ),
+        sealed,
+        context,
+    )
+
+    downstream_result = FuseGPUOperators().apply(PhysicalPlan(adjacent, {}, context))
+    assert downstream_result.dag is adjacent
+    assert downstream_result.dag.input_dependencies[0] is sealed
+
+    upstream = create_gpu_operator(read, source, context)
+    sealed_downstream = create_gpu_operator(
+        _spec(
+            "sealed-downstream",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+        ).for_gate2_stage(
+            specialized_read_parallelism_resolved=False,
+            uses_terminal_output_adapter=True,
+        ),
+        upstream,
+        context,
+    )
+    upstream_result = FuseGPUOperators().apply(
+        PhysicalPlan(sealed_downstream, {}, context)
+    )
+    assert upstream_result.dag is sealed_downstream
+    assert upstream_result.dag.input_dependencies[0] is upstream
+
+
+def test_fusion_refusal_is_a_silent_noop():
+    _register_fake_factory()
+    context = DataContext.get_current().copy()
+    context.enable_gpu_operator_fusion = True
+    source = InputDataBuffer(context, input_data=[])
+    upstream = create_gpu_operator(
+        _spec(
+            "upstream",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+        ),
+        source,
+        context,
+    )
+    incompatible = create_gpu_operator(
+        _spec(
+            "incompatible",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+            key=GPUExecutionCompatibilityKey(
+                runtime_id="different",
+                worker_lifecycle="session",
+                num_gpus=0,
+            ),
+        ),
+        upstream,
+        context,
+    )
+
+    result = FuseGPUOperators().apply(PhysicalPlan(incompatible, {}, context))
+    assert result.dag is incompatible
+    assert result.dag.input_dependencies[0] is upstream
+
+
+def test_backend_refusal_of_combined_spec_is_a_silent_noop():
+    register_gpu_operator_factory(
+        "single_spec", _SingleSpecFactory(), replace_existing=True
+    )
+    context = DataContext.get_current().copy()
+    context.enable_gpu_operator_fusion = True
+    source = InputDataBuffer(context, input_data=[])
+    upstream = create_gpu_operator(
+        _spec(
+            "upstream",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+            backend="single_spec",
+        ),
+        source,
+        context,
+    )
+    downstream = create_gpu_operator(
+        _spec(
+            "downstream",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+            backend="single_spec",
+        ),
+        upstream,
+        context,
+    )
+
+    result = FuseGPUOperators().apply(PhysicalPlan(downstream, {}, context))
+    assert result.dag is downstream
+    assert result.dag.input_dependencies[0] is upstream
+
+
+def test_multiple_gpu_regions_are_allowed_and_optimized_independently():
+    _register_fake_factory()
+    context = DataContext.get_current().copy()
+    context.enable_gpu_operator_fusion = True
+    left_source = InputDataBuffer(context, input_data=[])
+    right_source = InputDataBuffer(context, input_data=[])
+    left = create_gpu_operator(
+        _spec(
+            "left",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+        ),
+        left_source,
+        context,
+    )
+    right = create_gpu_operator(
+        _spec(
+            "right",
+            PayloadKind.CUDF_BATCH_STREAM,
+            PayloadKind.CUDF_BATCH_STREAM,
+        ),
+        right_source,
+        context,
+    )
+    root = PhysicalOperator("TwoGPURegions", [left, right], context)
+
+    result = FuseGPUOperators().apply(PhysicalPlan(root, {}, context))
+    assert result.dag is root
+    assert result.dag.input_dependencies == [left, right]
+
+
 def test_fused_creation_options_follow_external_boundaries():
     read_spec = _spec(
         "read",
         PayloadKind.RANGE_WORK,
         PayloadKind.CUDF_BATCH_STREAM,
-        "Read",
+        input_adapter=RANGE_WORK_ADAPTER_KEY,
     )
     group_spec = _spec(
         "group",
         PayloadKind.CUDF_BATCH_STREAM,
-        PayloadKind.OUTPUT_BATCH_STREAM,
-        "MapGroupPartitions",
+        PayloadKind.CUDF_BATCH_STREAM,
     )
     fused_spec = compose_gpu_operator_specs(read_spec, group_spec)
     upstream = GPUOperatorCreationOptions(
@@ -202,79 +384,197 @@ def test_gpu_rule_flag_off_is_exact_noop():
     assert FuseGPUOperators().apply(plan) is plan
 
 
-def test_required_complete_region_fails_if_a_boundary_stops_fusion():
-    plan = _three_node_plan(complete=True)
-    middle = plan.dag.input_dependencies[0]
-    middle._gpu_operator_spec = replace(
-        middle.gpu_operator_spec,
-        output_boundary=GPUBoundaryPolicy.REQUIRED,
-    )
-    with pytest.raises(GPURequiredFusionError, match="could not be fused"):
-        FuseGPUOperators().apply(plan)
-
-
-def test_required_complete_region_fuses_and_validates_provenance():
-    result = FuseGPUOperators().apply(_three_node_plan(complete=True))
-    assert result.dag.gpu_operator_spec.logical_provenance == (
-        "Read",
-        "MapBatches",
-        "MapGroupPartitions",
+def _retry_policy_for_context(context):
+    return GPUStageRetryPolicy(
+        actor_task_retry_on_errors=context.actor_task_retry_on_errors,
+        actor_init_retry_on_errors=context.actor_init_retry_on_errors,
+        actor_init_max_retries=context.actor_init_max_retries,
+        retried_map_errors=context.retried_map_errors,
+        max_map_retries=context.max_map_retries,
+        retried_io_errors=context.retried_io_errors,
     )
 
 
-def test_required_complete_region_rejects_an_additional_optional_gpu_marker():
-    required = FuseGPUOperators().apply(_three_node_plan(complete=True))
-    context = required.context
-    optional_source = InputDataBuffer(context, input_data=[])
-    optional_spec = replace(
-        _spec(
-            "optional",
-            PayloadKind.RAY_BLOCK_STREAM,
-            PayloadKind.RAY_BLOCK_STREAM,
-            "Optional",
+def _sealed_actor_spec(context, *, retry_policy=None):
+    key = GPUExecutionCompatibilityKey(
+        num_gpus=0,
+        retry_policy=retry_policy or _retry_policy_for_context(context),
+    )
+    spec = _spec(
+        "actor-stage",
+        PayloadKind.RANGE_WORK,
+        PayloadKind.RANGE_DATA,
+        backend="actor_pool",
+        key=key,
+        input_adapter=RANGE_WORK_ADAPTER_KEY,
+        output_adapter=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    )
+    return spec.for_gate2_stage(
+        specialized_read_parallelism_resolved=True,
+        uses_terminal_output_adapter=True,
+    )
+
+
+def test_actor_pool_gpu_operator_uses_effective_stock_retry_defaults():
+    context = DataContext.get_current().copy()
+    source = InputDataBuffer(context, input_data=[])
+    operator = create_gpu_operator(_sealed_actor_spec(context), source, context)
+
+    assert operator._ray_remote_args["max_restarts"] == -1
+    assert operator._ray_remote_args["max_task_retries"] == -1
+    assert RaySystemError in operator._ray_actor_task_remote_args["retry_exceptions"]
+
+
+def test_actor_pool_gpu_operator_honors_actor_task_retry_context():
+    class RetryableUserError(RuntimeError):
+        pass
+
+    context = DataContext.get_current().copy()
+    context.actor_task_retry_on_errors = [RetryableUserError]
+    source = InputDataBuffer(context, input_data=[])
+    operator = create_gpu_operator(_sealed_actor_spec(context), source, context)
+
+    retry_exceptions = operator._ray_actor_task_remote_args["retry_exceptions"]
+    assert RetryableUserError in retry_exceptions
+    assert RaySystemError in retry_exceptions
+
+
+def test_actor_pool_gpu_operator_honors_actor_retry_limits_from_key():
+    context = DataContext.get_current().copy()
+    source = InputDataBuffer(context, input_data=[])
+    policy = replace(
+        _retry_policy_for_context(context),
+        actor_max_restarts=2,
+        actor_max_task_retries=4,
+    )
+    operator = create_gpu_operator(
+        _sealed_actor_spec(context, retry_policy=policy), source, context
+    )
+
+    assert operator._ray_remote_args["max_restarts"] == 2
+    assert operator._ray_remote_args["max_task_retries"] == 4
+
+
+def test_actor_pool_factory_rejects_context_retry_policy_mismatch():
+    context = DataContext.get_current().copy()
+    spec = _sealed_actor_spec(context)
+    context.retried_map_errors = True
+    source = InputDataBuffer(context, input_data=[])
+
+    with pytest.raises(ValueError, match="does not match the execution DataContext"):
+        create_gpu_operator(spec, source, context)
+
+
+def test_map_spec_becomes_executable_by_registering_its_missing_import():
+    def passthrough(value, _context):
+        return value
+
+    context = DataContext.get_current().copy()
+    source = InputDataBuffer(context, input_data=[])
+    map_spec = _spec(
+        "standalone-map",
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+        backend="actor_pool",
+        key=GPUExecutionCompatibilityKey(
+            num_gpus=0,
+            retry_policy=_retry_policy_for_context(context),
         ),
-        region_id="optional-region",
     )
-    optional = create_gpu_operator(optional_spec, optional_source, context)
-    root = PhysicalOperator("SyntheticTwoInput", [required.dag, optional], context)
 
-    with pytest.raises(
-        GPURequiredFusionError, match="only one activated GPU region"
+    with pytest.raises(ValueError, match="does not support"):
+        create_gpu_operator(map_spec, source, context)
+
+    boundary_adapters = tuple(
+        GPUBoundaryAdapter(
+            key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+            direction=direction,
+            external_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_payload=PayloadKind.RANGE_DATA,
+            adapt=passthrough,
+        )
+        for direction in (
+            GPUBoundaryDirection.IMPORT,
+            GPUBoundaryDirection.EXPORT,
+        )
+    )
+    for adapter in boundary_adapters:
+        register_gpu_boundary_adapter(adapter)
+    try:
+        operator = create_gpu_operator(map_spec, source, context)
+        assert operator.gpu_operator_spec is map_spec
+    finally:
+        for adapter in boundary_adapters:
+            unregister_gpu_boundary_adapter(
+                key=adapter.key,
+                direction=adapter.direction,
+                external_payload=adapter.external_payload,
+                native_payload=adapter.native_payload,
+            )
+
+
+def test_actor_pool_factory_accepts_new_registered_ports_without_edits():
+    def passthrough(value, _context):
+        return value
+
+    adapter_key = "test-future-stage-adapter-v1"
+    for direction in (
+        GPUBoundaryDirection.IMPORT,
+        GPUBoundaryDirection.EXPORT,
     ):
-        FuseGPUOperators().apply(PhysicalPlan(root, {}, context))
-
-
-def test_gpu_physical_rule_order_is_explicit():
-    names = [rule.__name__ for rule in get_physical_ruleset()]
-    assert names == [
-        "InheritTargetMaxBlockSizeRule",
-        "FuseGPUOperators",
-        "SetReadParallelismRule",
-        "FuseOperators",
-        "ConfigureMapTaskMemoryUsingOutputSize",
-    ]
-
-
-def test_backend_factory_can_be_replaced_without_actor_pool_dependencies():
+        register_gpu_boundary_adapter(
+            GPUBoundaryAdapter(
+                key=adapter_key,
+                direction=direction,
+                external_payload=PayloadKind.RAY_BLOCK_STREAM,
+                native_payload=PayloadKind.CUDF_PARTITION,
+                adapt=passthrough,
+            ),
+            replace_existing=True,
+        )
     context = DataContext.get_current().copy()
     source = InputDataBuffer(context, input_data=[])
     spec = _spec(
-        "session_transform",
-        PayloadKind.RAY_BLOCK_STREAM,
-        PayloadKind.RAY_BLOCK_STREAM,
-        "Synthetic",
-    )
-    spec = replace(
-        spec,
-        execution_requirements=GPUExecutionRequirements(
-            backend_name="fake_session",
-            compatibility_key=replace(
-                spec.compatibility_key, worker_lifecycle="session"
-            ),
+        "future-stage",
+        PayloadKind.CUDF_PARTITION,
+        PayloadKind.CUDF_PARTITION,
+        backend="actor_pool",
+        key=GPUExecutionCompatibilityKey(
+            num_gpus=0,
+            retry_policy=_retry_policy_for_context(context),
         ),
+        input_adapter=adapter_key,
+        output_adapter=adapter_key,
+        terminal_output_adapter=adapter_key,
+    ).for_gate2_stage(
+        specialized_read_parallelism_resolved=False,
+        uses_terminal_output_adapter=False,
     )
-    register_gpu_operator_factory(
-        "fake_session", _FakeSessionFactory(), replace_existing=True
+
+    operator = create_gpu_operator(spec, source, context)
+    assert operator.gpu_operator_spec is spec
+
+
+def test_gpu_physical_rule_order_is_explicit_and_unique():
+    names = [rule.__name__ for rule in get_physical_ruleset()]
+    assert names == [
+        "InheritTargetMaxBlockSizeRule",
+        "SetReadParallelismRule",
+        "FuseGPUOperators",
+        "FuseOperators",
+        "ConfigureMapTaskMemoryUsingOutputSize",
+    ]
+    assert len(names) == len(set(names))
+
+
+def test_backend_factory_can_be_replaced_without_actor_pool_dependencies():
+    _register_fake_factory()
+    context = DataContext.get_current().copy()
+    source = InputDataBuffer(context, input_data=[])
+    spec = _spec(
+        "session-transform",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
     )
     operator = create_gpu_operator(spec, source, context)
     assert isinstance(operator, _FakeSessionGPUOperator)

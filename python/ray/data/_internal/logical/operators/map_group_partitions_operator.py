@@ -3,6 +3,7 @@ from typing import Callable, Iterator, List, Optional, Union
 
 from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data.block import BlockMetadata, DataBatch
+from ray.data.udf_properties import UDFProperties
 
 __all__ = ["MapGroupPartitions"]
 
@@ -14,10 +15,15 @@ class MapGroupPartitions(LogicalOperator):
     key: Union[str, List[str]]
     num_partitions: Optional[int]
     fn: Callable[..., Union[DataBatch, Iterator[DataBatch]]]
+    udf_properties: Optional[UDFProperties] = None
     input_dependencies: List[LogicalOperator] = field(repr=False, kw_only=True)
 
     def __post_init__(self):
         assert len(self.input_dependencies) == 1, len(self.input_dependencies)
+        if self.udf_properties is not None and not isinstance(
+            self.udf_properties, UDFProperties
+        ):
+            raise TypeError("udf_properties must be a UDFProperties instance or None")
         object.__setattr__(self, "_name", "MapGroupPartitions")
 
     @property
