@@ -1,61 +1,45 @@
-"""Small property vocabulary for required GPU-region composition."""
+"""Typed facts and requirements exchanged by declarative GPU operators."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Optional, Tuple
+from typing import Sequence, Tuple
 
 
-class Evidence(str, Enum):
-    DERIVED = "derived"
-    USER_ASSERTED = "user_asserted"
-    OPERATOR_GUARANTEE = "operator_guarantee"
-
-
-class PropertyValue:
-    """Marker base for a fact advertised on a physical edge."""
-
-
-class PartitioningProperty(PropertyValue):
-    """Marker base for semantic partitioning facts."""
+class PropertyFact:
+    """Marker for a fact proven at one physical edge."""
 
 
 class PropertyRequirement:
-    """Marker base for a fact required at an operator input."""
+    """Marker for a fact required at one physical edge."""
+
+
+def _normalize_keys(value: Sequence[str], owner: str) -> Tuple[str, ...]:
+    keys = tuple(value)
+    if not keys or not all(isinstance(key, str) and key for key in keys):
+        raise ValueError(f"{owner} requires nonempty string keys")
+    return keys
 
 
 @dataclass(frozen=True)
-class UnknownPartitioning(PartitioningProperty):
-    pass
-
-
-@dataclass(frozen=True)
-class RangePartitioning(PartitioningProperty):
+class _RangeProperty:
     keys: Tuple[str, ...]
     scheme_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "keys", tuple(self.keys))
-        if not self.keys:
-            raise ValueError("RangePartitioning requires at least one key")
-        if not self.scheme_id:
-            raise ValueError("RangePartitioning requires a nonempty scheme_id")
+        object.__setattr__(
+            self, "keys", _normalize_keys(self.keys, type(self).__name__)
+        )
+        if not isinstance(self.scheme_id, str) or not self.scheme_id:
+            raise ValueError(f"{type(self).__name__} requires a nonempty scheme_id")
 
 
-@dataclass(frozen=True)
-class CompletePartitionBundles(PropertyValue, PropertyRequirement):
-    """Each logical partition is delivered as one complete planner unit."""
+class RangePartitioning(_RangeProperty, PropertyFact):
+    pass
 
 
-@dataclass(frozen=True)
-class PropertyFact:
-    value: PropertyValue
-    evidence: Evidence
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.value, PropertyValue):
-            raise TypeError("PropertyFact.value must be a PropertyValue")
+class RangePartitioningRequired(_RangeProperty, PropertyRequirement):
+    pass
 
 
 @dataclass(frozen=True)
@@ -63,78 +47,12 @@ class KeysColocated(PropertyRequirement):
     keys: Tuple[str, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "keys", tuple(self.keys))
-        if not self.keys:
-            raise ValueError("KeysColocated requires at least one key")
-
-
-@dataclass(frozen=True)
-class RangePartitioningRequired(PropertyRequirement):
-    """Require the exact range scheme used to lower a preserving operator."""
-
-    keys: Tuple[str, ...]
-    scheme_id: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "keys", tuple(self.keys))
-        if not self.keys:
-            raise ValueError("RangePartitioningRequired requires at least one key")
-        if not self.scheme_id:
-            raise ValueError("RangePartitioningRequired requires a scheme_id")
-
-
-class ValidationObligation:
-    """Marker for a runtime proof that must be discharged inside one stage."""
-
-
-@dataclass(frozen=True)
-class RowsOwnedByRange(ValidationObligation):
-    leading_key: str
-    scheme_id: str
-
-
-@dataclass(frozen=True)
-class PartitioningValidation:
-    kind: str
-    config: Any
-    obligations: Tuple[ValidationObligation, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "obligations", tuple(self.obligations))
-        if not self.kind:
-            raise ValueError("partitioning validation kind must be nonempty")
-        if not self.obligations:
-            raise ValueError("partitioning validation must discharge an obligation")
-        if not all(
-            isinstance(obligation, ValidationObligation)
-            for obligation in self.obligations
-        ):
-            raise TypeError("invalid partitioning validation obligation")
-
-
-@dataclass(frozen=True)
-class PropertyReadvertisement:
-    output_properties: Tuple[PropertyFact, ...]
-    partitioning_validations: Tuple[PartitioningValidation, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "output_properties", tuple(self.output_properties))
         object.__setattr__(
-            self,
-            "partitioning_validations",
-            tuple(self.partitioning_validations),
-        )
-
-    @property
-    def created_obligations(self) -> Tuple[ValidationObligation, ...]:
-        return tuple(
-            obligation
-            for validation in self.partitioning_validations
-            for obligation in validation.obligations
+            self, "keys", _normalize_keys(self.keys, type(self).__name__)
         )
 
 
-class PartitioningPreservationError(ValueError):
+class PropertyConflict(ValueError):
     pass
 
 
@@ -142,29 +60,21 @@ def property_satisfies(
     fact: PropertyFact,
     requirement: PropertyRequirement,
 ) -> bool:
-    value = fact.value
-    if isinstance(value, RangePartitioning) and isinstance(
-        requirement, KeysColocated
-    ):
+    if not isinstance(fact, RangePartitioning):
+        return False
+    if isinstance(requirement, RangePartitioningRequired):
+        return fact.keys == requirement.keys and fact.scheme_id == requirement.scheme_id
+    if isinstance(requirement, KeysColocated):
         return (
-            len(value.keys) <= len(requirement.keys)
-            and requirement.keys[: len(value.keys)] == value.keys
+            len(fact.keys) <= len(requirement.keys)
+            and requirement.keys[: len(fact.keys)] == fact.keys
         )
-    if isinstance(value, RangePartitioning) and isinstance(
-        requirement, RangePartitioningRequired
-    ):
-        return (
-            value.keys == requirement.keys
-            and value.scheme_id == requirement.scheme_id
-        )
-    return isinstance(value, CompletePartitionBundles) and isinstance(
-        requirement, CompletePartitionBundles
-    )
+    return False
 
 
 def requirements_satisfied(
-    facts: Tuple[PropertyFact, ...],
-    requirements: Tuple[PropertyRequirement, ...],
+    facts: Sequence[PropertyFact],
+    requirements: Sequence[PropertyRequirement],
 ) -> bool:
     return all(
         any(property_satisfies(fact, requirement) for fact in facts)
@@ -172,70 +82,12 @@ def requirements_satisfied(
     )
 
 
-def usable_partitioning_fact(
-    facts: Tuple[PropertyFact, ...],
-) -> Optional[PropertyFact]:
-    partitioning = tuple(
-        fact for fact in facts if isinstance(fact.value, PartitioningProperty)
-    )
-    if len(partitioning) > 1:
-        raise PartitioningPreservationError(
-            f"edge advertises conflicting partitioning facts: {partitioning!r}"
+def range_partitioning_fact(
+    facts: Sequence[PropertyFact],
+) -> RangePartitioning | None:
+    ranges = tuple(fact for fact in facts if isinstance(fact, RangePartitioning))
+    if len(ranges) > 1:
+        raise PropertyConflict(
+            f"edge advertises conflicting range partitioning facts: {ranges!r}"
         )
-    if not partitioning or isinstance(partitioning[0].value, UnknownPartitioning):
-        return None
-    return partitioning[0]
-
-
-def readvertise_preserved_properties(
-    facts: Tuple[PropertyFact, ...],
-    *,
-    preserves_partitioning: bool,
-    preserves_complete_partition_bundles: bool,
-    plan_validations: bool = True,
-) -> PropertyReadvertisement:
-    """Return only facts explicitly preserved by the current operator."""
-
-    facts = tuple(facts)
-    partitioning = usable_partitioning_fact(facts)
-    validations: Tuple[PartitioningValidation, ...] = ()
-    if preserves_partitioning and partitioning is not None:
-        value = partitioning.value
-        if not isinstance(value, RangePartitioning):
-            raise PartitioningPreservationError(
-                f"V1 cannot preserve {type(value).__name__}"
-            )
-        if plan_validations:
-            validations = _range_partitioning_validations(value)
-        output = [PropertyFact(value, Evidence.OPERATOR_GUARANTEE)]
-    else:
-        output = [PropertyFact(UnknownPartitioning(), Evidence.DERIVED)]
-
-    if preserves_complete_partition_bundles and any(
-        isinstance(fact.value, CompletePartitionBundles) for fact in facts
-    ):
-        output.append(
-            PropertyFact(
-                CompletePartitionBundles(),
-                Evidence.OPERATOR_GUARANTEE,
-            )
-        )
-    return PropertyReadvertisement(tuple(output), validations)
-
-
-def _range_partitioning_validations(
-    value: RangePartitioning,
-) -> Tuple[PartitioningValidation, ...]:
-    from ray.data._internal.execution.gpu.transforms.map_batches import (
-        VALIDATE_RANGE_OWNERSHIP_KIND,
-        ValidateRangeOwnershipConfig,
-    )
-
-    obligation = RowsOwnedByRange(value.keys[0], value.scheme_id)
-    return (
-        PartitioningValidation(
-            kind=VALIDATE_RANGE_OWNERSHIP_KIND,
-            config=ValidateRangeOwnershipConfig(value.keys[0], value.keys),
-            obligations=(obligation,),
-        ),
-    )
+    return ranges[0] if ranges else None

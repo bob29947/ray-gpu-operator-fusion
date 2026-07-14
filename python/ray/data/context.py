@@ -538,9 +538,12 @@ class DataContext:
             ``ParquetScanner`` / ``ParquetFileReader``). Defaults to False — V1
             remains the production path while V2 bakes.
         enable_gpu_operator_fusion: Whether to enable the opt-in GPU operator
-            lowering and required physical-fusion path used by
-            :meth:`~ray.data.grouped_data.GroupedData.map_group_partitions`.
-            Defaults to False. Ordinary Ray Data GPU operations are unaffected.
+            lowering and strict full-fusion execution policy. When enabled, every
+            eligible GPU operation is planned independently, physical optimization
+            must materialize one GPU region covering the complete data pipeline, and
+            unsupported or partially fused plans fail before executor startup. This
+            is a workload-scoped setting and isn't a session-wide compatibility mode.
+            Defaults to False, which preserves ordinary Ray Data planning.
         parquet_chunker_target_chunk_size: Target on-disk bytes per chunk used
             by ``ParquetFileChunker``. The chunker reads each file's footer at
             listing time and bundles consecutive row groups until their on-disk

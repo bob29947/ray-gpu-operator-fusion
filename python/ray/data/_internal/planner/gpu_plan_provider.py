@@ -1,28 +1,29 @@
-"""Planning for the required-fusion Parquet/cuDF GPU pipeline.
-
-The planner deliberately supports one shape in V1::
-
-    Read -> MapBatches -> MapGroupPartitions
-
-It lowers each logical operator to an independent, non-executable physical
-operator.  It never composes specifications and never creates an execution
-backend.  The physical GPU fusion rule owns both of those operations.
-"""
+"""Per-node planning for fail-closed GPU physical fusion."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Dict, Iterable, Mapping, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Mapping, Optional, Sequence
 
-from ray.data._internal.execution.gpu.operator import PlannedGPUOperator
+from ray.data._internal.execution.gpu.operator import (
+    PlannedGPUOperator,
+    has_gpu_operator_factory,
+)
+from ray.data._internal.execution.gpu.runtime import supports_gpu_transform_runtime
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data._internal.logical.operators import MapBatches, MapGroupPartitions, Read
-from ray.data._internal.planner.gpu_execution_profile import (
-    reconcile_read_remote_args,
+from ray.data._internal.planner.gpu_lowering.interfaces import (
+    GPUDecision,
+    GPUDecline,
+    GPUInvalid,
+    GPULogicalLowerer,
+    GPULoweredOperator,
+    GPULoweringContext,
+    GPUPlan,
+    is_positive_int,
 )
-from ray.data._internal.planner.gpu_lowering.interfaces import GPULoweringContext
 from ray.data._internal.planner.gpu_lowering.map_batches_lowerer import (
     GPUMapBatchesLowerer,
 )
@@ -35,9 +36,12 @@ from ray.data._internal.planner.gpu_planning_errors import (
     GPUPlanningErrorReason,
 )
 from ray.data._internal.planner.gpu_read_source_provider import (
-    GPUReadSourceDemand,
     GPUReadSourceProvider,
     ParquetRangeGPUReadProvider,
+)
+from ray.data._internal.planner.gpu_requirement_analysis import (
+    GPURequirementAnalysis,
+    analyze_gpu_requirements,
 )
 from ray.data.context import DataContext
 
@@ -48,314 +52,277 @@ class GPUPlannedStage:
     op_map: Mapping[PhysicalOperator, LogicalOperator]
 
 
+_GPU_LOGICAL_LOWERERS: Dict[type, GPULogicalLowerer] = {}
+_GPU_SOURCE_PROVIDERS: Dict[str, GPUReadSourceProvider] = {}
+_BUILTINS_REGISTERED = False
+
+
+def register_gpu_logical_lowerer(
+    logical_type: type,
+    lowerer: GPULogicalLowerer,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    if logical_type in _GPU_LOGICAL_LOWERERS and not replace_existing:
+        raise ValueError(f"GPU logical lowerer already registered: {logical_type!r}")
+    _GPU_LOGICAL_LOWERERS[logical_type] = lowerer
+
+
+def unregister_gpu_logical_lowerer(
+    logical_type: type,
+    *,
+    expected: Optional[GPULogicalLowerer] = None,
+) -> Optional[GPULogicalLowerer]:
+    lowerer = _GPU_LOGICAL_LOWERERS.get(logical_type)
+    if lowerer is None:
+        return None
+    if expected is not None and lowerer is not expected:
+        raise ValueError("registered GPU logical lowerer is not the expected instance")
+    return _GPU_LOGICAL_LOWERERS.pop(logical_type)
+
+
+def register_gpu_source_provider(
+    provider: GPUReadSourceProvider,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    name = getattr(provider, "provider_name", None)
+    if not isinstance(name, str) or not name:
+        raise ValueError("GPU source provider requires a nonempty provider_name")
+    if name in _GPU_SOURCE_PROVIDERS and not replace_existing:
+        raise ValueError(f"GPU source provider already registered: {name!r}")
+    _GPU_SOURCE_PROVIDERS[name] = provider
+
+
+def unregister_gpu_source_provider(
+    provider_name: str,
+    *,
+    expected: Optional[GPUReadSourceProvider] = None,
+) -> Optional[GPUReadSourceProvider]:
+    provider = _GPU_SOURCE_PROVIDERS.get(provider_name)
+    if provider is None:
+        return None
+    if expected is not None and provider is not expected:
+        raise ValueError("registered GPU source provider is not the expected instance")
+    return _GPU_SOURCE_PROVIDERS.pop(provider_name)
+
+
+def _ensure_builtins_registered() -> None:
+    global _BUILTINS_REGISTERED
+    if _BUILTINS_REGISTERED:
+        return
+    _BUILTINS_REGISTERED = True
+    for logical_type, lowerer in (
+        (Read, GPUReadLowerer()),
+        (MapBatches, GPUMapBatchesLowerer()),
+        (MapGroupPartitions, GPUMapGroupPartitionsLowerer()),
+    ):
+        _GPU_LOGICAL_LOWERERS.setdefault(logical_type, lowerer)
+    provider = ParquetRangeGPUReadProvider()
+    _GPU_SOURCE_PROVIDERS.setdefault(provider.provider_name, provider)
+
+
+def get_gpu_logical_lowerer(
+    logical_op: LogicalOperator,
+) -> Optional[GPULogicalLowerer]:
+    _ensure_builtins_registered()
+    return _GPU_LOGICAL_LOWERERS.get(type(logical_op))
+
+
 def create_gpu_required_fusion_planner(
     root: LogicalOperator,
     data_context: DataContext,
     *,
     source_provider: Optional[GPUReadSourceProvider] = None,
 ) -> "GPURequiredFusionPlanner":
-    """Create a plan-local exact-shape GPU planner.
-
-    ``data_context`` is accepted to preserve the existing planner hook.  No
-    footer reads, range planning, spec composition, or backend construction
-    occurs until :meth:`GPURequiredFusionPlanner.try_plan` sees an MGP anchor.
-    """
-
-    del data_context
-    return GPURequiredFusionPlanner(
-        root,
-        source_provider=source_provider or ParquetRangeGPUReadProvider(),
+    _ensure_builtins_registered()
+    providers = (
+        (source_provider,)
+        if source_provider is not None
+        else tuple(_GPU_SOURCE_PROVIDERS.values())
     )
+    return GPURequiredFusionPlanner(root, data_context, source_providers=providers)
 
 
 class GPURequiredFusionPlanner:
-    """Lower exactly one Read/MapBatches/MGP component to deferred GPU nodes."""
+    """Analyze once, then independently lower every registered logical occurrence."""
 
     def __init__(
         self,
         root: LogicalOperator,
+        data_context: DataContext,
         *,
-        source_provider: GPUReadSourceProvider,
+        source_providers: Sequence[GPUReadSourceProvider],
     ) -> None:
-        operators = tuple(_post_order_logical(root))
-        self._consumer_counts = _logical_consumer_counts(operators)
-        self._logical_node_ids = {
-            op: f"logical-{ordinal:04d}-{type(op).__name__}"
-            for ordinal, op in enumerate(operators)
-        }
-        self._source_provider = source_provider
-        self._read_lowerer = GPUReadLowerer()
-        self._map_lowerer = GPUMapBatchesLowerer()
-        self._mgp_lowerer = GPUMapGroupPartitionsLowerer()
+        self._source_providers = tuple(source_providers)
+        self._analysis: GPURequirementAnalysis = analyze_gpu_requirements(
+            root,
+            data_context,
+            get_gpu_logical_lowerer,
+        )
+        self._output_contracts = {}
 
-    def try_plan(
+    @property
+    def requirement_analysis(self) -> GPURequirementAnalysis:
+        return self._analysis
+
+    def plan_node(
         self,
         logical_op: LogicalOperator,
         data_context: DataContext,
-    ) -> Optional[GPUPlannedStage]:
-        if type(logical_op) is not MapGroupPartitions:
-            return None
-        return self._plan_exact_component(logical_op, data_context)
+    ) -> GPUDecision:
+        lowerer = get_gpu_logical_lowerer(logical_op)
+        analysis = self._analysis.logical_analysis(logical_op)
+        if lowerer is None or analysis is None:
+            return GPUDecline(
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                f"no GPU lowerer for {_op_label(logical_op)}",
+            )
+        if not analysis.accepted:
+            return GPUDecline(
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                f"operator={_op_label(logical_op)}; capability={analysis.reason}",
+            )
+        if data_context.checkpoint_config is not None:
+            return GPUDecline(
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                f"operator={_op_label(logical_op)}; checkpointing is unsupported",
+            )
+        target_bytes = data_context.target_max_block_size
+        if not is_positive_int(target_bytes):
+            return GPUInvalid(
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                "DataContext.target_max_block_size must be positive",
+            )
+        input_facts, input_execution = self._input_contract(logical_op)
+        execution = analysis.execution_requirements or input_execution
+        source_provider = None
+        source_analysis = None
+        if not logical_op.input_dependencies:
+            refusals = []
+            for provider in self._source_providers:
+                try:
+                    support = provider.analyze(
+                        logical_op,
+                        self._analysis.demands_for(logical_op),
+                    )
+                except GPUPlanningError as error:
+                    if error.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY:
+                        refusals.append(f"{provider.provider_name}:{error.detail}")
+                        continue
+                    return _decision_from_error(error)
+                if support.accepted:
+                    source_provider = provider
+                    source_analysis = support.provider_state
+                    execution = support.execution_requirements
+                    break
+                refusals.append(f"{provider.provider_name}:{support.reason}")
+            if source_provider is None:
+                return GPUDecline(
+                    GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                    f"no GPU source provider accepted {_op_label(logical_op)} "
+                    f"({', '.join(refusals)})",
+                )
+        context = GPULoweringContext(
+            target_max_block_size=int(target_bytes),
+            input_facts=input_facts,
+            execution_requirements=execution,
+            source_provider=source_provider,
+            source_analysis=source_analysis,
+            retried_io_errors=tuple(data_context.retried_io_errors),
+        )
+        try:
+            lowered = lowerer.lower(logical_op, context)
+        except GPUPlanningError as error:
+            return _decision_from_error(error)
+        refusal = _local_implementation_gate(lowered)
+        if refusal is not None:
+            return refusal
+        self._output_contracts[logical_op] = (
+            lowered.spec.output_facts,
+            lowered.spec.execution_requirements,
+        )
+        return GPUPlan(lowered)
 
-    def _plan_exact_component(
+    def materialize_planned_node(
         self,
-        anchor: MapGroupPartitions,
+        logical_op: LogicalOperator,
+        physical_children: Sequence[PhysicalOperator],
+        decision: GPUPlan,
         data_context: DataContext,
     ) -> GPUPlannedStage:
-        if data_context.checkpoint_config is not None:
-            _unsupported(anchor, "checkpointing is not supported")
-
-        read_op, map_op = self._discover_exact_shape(anchor)
-        read_analysis = self._read_lowerer.analyze(read_op, data_context)
-        map_analysis = self._map_lowerer.analyze(map_op, data_context)
-        mgp_analysis = self._mgp_lowerer.analyze(anchor, data_context)
-        for op, analysis in (
-            (read_op, read_analysis),
-            (map_op, map_analysis),
-            (anchor, mgp_analysis),
-        ):
-            if not analysis.accepted:
-                _unsupported(
-                    anchor,
-                    f"operator={_op_label(op)}; capability={analysis.reason}",
+        lowered = decision.lowered
+        artifacts = lowered.source_artifacts
+        op_map: Dict[PhysicalOperator, LogicalOperator] = {}
+        if artifacts is not None:
+            if physical_children:
+                raise ValueError("a GPU source cannot consume physical children")
+            source_input = InputDataBuffer(
+                data_context,
+                input_data_factory=artifacts.input_data_factory,
+            )
+            source_input.set_logical_operators(logical_op)
+            input_op = source_input
+            op_map[source_input] = logical_op
+            owns_input_parallelism = True
+        else:
+            if len(physical_children) != 1:
+                raise ValueError(
+                    "V1 GPU logical lowerers require exactly one physical input"
                 )
-
-        if not map_analysis.preserves_partitioning:
-            _unsupported(
-                anchor,
-                "the cuDF MapBatches UDF must declare "
-                "UDFProperties(preserves_partitioning=True)",
-            )
-        requirements = map_analysis.execution_requirements
-        if requirements is None:
-            raise AssertionError("GPU MapBatches analysis must declare execution")
-        requirements = reconcile_read_remote_args(
-            requirements,
-            read_op.ray_remote_args,
-            consumer=_op_label(anchor),
-        )
-
-        group_keys = mgp_analysis.partition_keys
-        target_ranges = (
-            2 * requirements.compatibility_key.max_workers
-            if mgp_analysis.requested_partitions is None
-            else mgp_analysis.requested_partitions
-        )
-        assert target_ranges is not None
-        demand = GPUReadSourceDemand(
-            group_keys=group_keys,
-            target_ranges=target_ranges,
-            num_workers=requirements.compatibility_key.max_workers,
-        )
-        support = self._source_provider.supports(read_op, demand)
-        if not support.accepted:
-            _unsupported(
-                anchor,
-                "the Read is not supported by the required Parquet range source "
-                f"({support.reason})",
-            )
-
-        target_bytes = data_context.target_max_block_size
-        if (
-            not isinstance(target_bytes, int)
-            or isinstance(target_bytes, bool)
-            or target_bytes <= 0
-        ):
-            _unsupported(anchor, "DataContext.target_max_block_size must be positive")
-
-        logical_ops: Tuple[LogicalOperator, ...] = (read_op, map_op, anchor)
-        provenance = tuple(self._logical_node_ids[op] for op in logical_ops)
-        fusion_group_id = f"gpu-required:{provenance[0]}->{provenance[-1]}"
-        context = GPULoweringContext(
-            stage_id=fusion_group_id,
-            logical_node_id=provenance[0],
-            group_keys=group_keys,
-            source_provider=self._source_provider,
-            execution_requirements=requirements,
-            target_max_block_size=int(target_bytes),
-            retried_io_errors=tuple(data_context.retried_io_errors),
-            target_ranges=target_ranges,
-            num_workers=requirements.compatibility_key.max_workers,
-        )
-
-        read_lowered = self._read_lowerer.lower(read_op, context)
-        read_spec = _bind_required_region(
-            read_lowered.spec,
-            fusion_group_id=fusion_group_id,
-            required_provenance=provenance,
-            owns_input_parallelism=True,
-        )
-        map_context = read_lowered.downstream_context.for_operator(
-            logical_node_id=provenance[1],
-        )
-        map_lowered = self._map_lowerer.lower(map_op, map_context)
-        map_spec = _bind_required_region(
-            map_lowered.spec,
-            fusion_group_id=fusion_group_id,
-            required_provenance=provenance,
-        )
-        mgp_context = map_lowered.downstream_context.for_operator(
-            logical_node_id=provenance[2],
-            group_keys=group_keys,
-        )
-        mgp_lowered = self._mgp_lowerer.lower(anchor, mgp_context)
-        mgp_spec = _bind_required_region(
-            mgp_lowered.spec,
-            fusion_group_id=fusion_group_id,
-            required_provenance=provenance,
-            uses_terminal_output_adapter=True,
-        )
-
-        artifacts = read_lowered.source_artifacts
-        if artifacts is None:
-            _unsupported(anchor, "GPU Read lowering returned no source work")
-        source_input = InputDataBuffer(
+            input_op = physical_children[0]
+            owns_input_parallelism = False
+        physical = PlannedGPUOperator(
+            lowered.spec,
+            input_op,
             data_context,
-            input_data_factory=artifacts.input_data_factory,
+            lowered.creation_options,
+            owns_input_parallelism=owns_input_parallelism,
         )
-        read_node = PlannedGPUOperator(
-            read_spec,
-            source_input,
-            data_context,
-            read_lowered.creation_options,
-        )
-        map_node = PlannedGPUOperator(
-            map_spec,
-            read_node,
-            data_context,
-            map_lowered.creation_options,
-        )
-        mgp_node = PlannedGPUOperator(
-            mgp_spec,
-            map_node,
-            data_context,
-            mgp_lowered.creation_options,
-        )
+        physical.set_logical_operators(logical_op)
+        op_map[physical] = logical_op
+        return GPUPlannedStage(physical, op_map)
 
-        source_input.set_logical_operators(read_op)
-        for physical, logical in (
-            (read_node, read_op),
-            (map_node, map_op),
-            (mgp_node, anchor),
-        ):
-            physical.set_logical_operators(logical)
-        return GPUPlannedStage(
-            root=mgp_node,
-            op_map={
-                source_input: read_op,
-                read_node: read_op,
-                map_node: map_op,
-                mgp_node: anchor,
-            },
-        )
+    def record_stock_fallback(self, logical_op: LogicalOperator) -> None:
+        self._output_contracts[logical_op] = ((), None)
 
-    def _discover_exact_shape(
-        self,
-        anchor: MapGroupPartitions,
-    ) -> Tuple[Read, MapBatches]:
-        if len(anchor.input_dependencies) != 1:
-            _unsupported(anchor, "MapGroupPartitions must have exactly one input")
-        map_op = anchor.input_dependencies[0]
-        if type(map_op) is not MapBatches or len(map_op.input_dependencies) != 1:
-            _unsupported(
-                anchor,
-                "V1 requires exactly Read -> one cuDF MapBatches -> "
-                "MapGroupPartitions",
-            )
-        read_op = map_op.input_dependencies[0]
-        if type(read_op) is not Read:
-            _unsupported(
-                anchor,
-                "V1 requires exactly Read -> one cuDF MapBatches -> "
-                "MapGroupPartitions",
-            )
-        for op in (read_op, map_op):
-            if self._consumer_counts.get(op, 0) != 1:
-                _unsupported(
-                    anchor,
-                    f"{_op_label(op)} is shared by multiple logical consumers",
-                )
-        if self._consumer_counts.get(anchor, 0) > 1:
-            _unsupported(anchor, "MapGroupPartitions is shared by multiple consumers")
-        return read_op, map_op
+    def _input_contract(self, logical_op: LogicalOperator):
+        if len(logical_op.input_dependencies) != 1:
+            return (), None
+        child = logical_op.input_dependencies[0]
+        return self._output_contracts.get(child, ((), None))
 
 
-def _bind_required_region(
-    spec,
-    *,
-    fusion_group_id: str,
-    required_provenance: Tuple[str, ...],
-    owns_input_parallelism: bool = False,
-    uses_terminal_output_adapter: bool = False,
-):
-    return replace(
-        spec,
-        fusion_group_id=fusion_group_id,
-        required_logical_provenance=required_provenance,
-        requires_complete_fusion=True,
-        owns_input_parallelism=owns_input_parallelism,
-        uses_terminal_output_adapter=uses_terminal_output_adapter,
+def _decision_from_error(error: GPUPlanningError) -> GPUDecision:
+    result_type = (
+        GPUInvalid
+        if error.reason is GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS
+        else GPUDecline
     )
+    return result_type(error.reason, error.detail)
 
 
-def _post_order_logical(root: LogicalOperator) -> Iterable[LogicalOperator]:
-    visited: set[LogicalOperator] = set()
-
-    def visit(op: LogicalOperator):
-        if op in visited:
-            return
-        visited.add(op)
-        for child in op.input_dependencies:
-            yield from visit(child)
-        yield op
-
-    yield from visit(root)
-
-
-def _logical_consumer_counts(
-    operators: Tuple[LogicalOperator, ...],
-) -> Dict[LogicalOperator, int]:
-    counts = {op: 0 for op in operators}
-    for op in operators:
-        for child in op.input_dependencies:
-            counts[child] += 1
-    return counts
-
-
-def _unsupported(anchor: MapGroupPartitions, detail: str) -> None:
-    raise GPUPlanningError(
-        GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-        f"consumer={_op_label(anchor)}; {detail}",
-    )
+def _local_implementation_gate(
+    lowered: GPULoweredOperator,
+) -> Optional[GPUDecline]:
+    spec = lowered.spec
+    for transform in spec.transforms:
+        if not supports_gpu_transform_runtime(transform):
+            return GPUDecline(
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                f"no valid GPU transform runtime for {transform.runtime_key!r}",
+            )
+    if not any(
+        has_gpu_operator_factory(key)
+        for key in spec.execution_requirements.backend_keys
+    ):
+        return GPUDecline(
+            GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+            "no registered GPU backend factory for "
+            f"{sorted(spec.execution_requirements.backend_keys)!r}",
+        )
+    return None
 
 
 def _op_label(op: LogicalOperator) -> str:
     return f"{type(op).__name__}({op.name})"
-
-
-def raise_mgp_without_required_gpu_fusion(
-    logical_op: MapGroupPartitions,
-    *,
-    gpu_enabled: bool,
-) -> None:
-    detail = (
-        "MapGroupPartitions has no CPU/stock fallback and requires "
-        "DataContext.enable_gpu_operator_fusion=True"
-        if not gpu_enabled
-        else "MapGroupPartitions was not claimed by the exact required-fusion "
-        "GPU planner and has no CPU/stock fallback"
-    )
-    raise GPUPlanningError(
-        GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-        f"consumer={logical_op.name}; {detail}",
-    )
-
-
-__all__ = [
-    "GPURequiredFusionPlanner",
-    "GPUPlannedStage",
-    "GPUPlanningError",
-    "GPUPlanningErrorReason",
-    "create_gpu_required_fusion_planner",
-    "raise_mgp_without_required_gpu_fusion",
-]

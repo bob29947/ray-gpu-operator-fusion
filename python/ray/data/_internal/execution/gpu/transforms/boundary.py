@@ -1,4 +1,4 @@
-"""Stock-compatible external boundary helpers for GPU range operators."""
+"""Ray-block boundary transforms for the V1 range-data runtime."""
 
 from __future__ import annotations
 
@@ -7,6 +7,10 @@ from collections.abc import Iterable
 from typing import Any
 
 from ray.data._internal.execution.gpu.parquet_types import ParquetRangeWork
+
+
+IMPORT_RANGE_WORK_KIND = "import_range_work"
+EXPORT_RANGE_DATA_KIND = "export_range_data"
 
 
 def serialize_range_work(work: ParquetRangeWork) -> bytes:
@@ -59,3 +63,35 @@ def descriptor_bundles(work: Iterable[ParquetRangeWork]) -> list[Any]:
             )
         )
     return bundles
+
+
+class ImportRangeWorkRuntime:
+    def initialize(self) -> None:
+        pass
+
+    def apply(self, value: Any, task_context: Any) -> ParquetRangeWork:
+        del task_context
+        return decode_one_range_work(value)
+
+
+class ExportRangeDataRuntime:
+    """Eagerly surface GPU, I/O, UDF, and conversion failures before first yield.
+
+    Recoverable actor death relies on Ray streaming retries; exhausted retries do
+    not provide a transactional rollback barrier.
+    """
+
+    def initialize(self) -> None:
+        pass
+
+    def apply(self, value: Any, task_context: Any) -> Any:
+        del task_context
+        from ray.data._internal.execution.gpu.payloads import RangeData
+        from ray.data.block import BlockAccessor
+
+        if not isinstance(value, RangeData):
+            raise TypeError("export_range_data expected actor-local RangeData")
+        if value.value is None:
+            return iter(())
+        blocks = tuple(BlockAccessor.batch_to_block(batch) for batch in value.value)
+        return iter(blocks)

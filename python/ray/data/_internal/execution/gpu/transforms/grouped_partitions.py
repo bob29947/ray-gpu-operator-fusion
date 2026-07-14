@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import collections.abc
-import numbers
 from dataclasses import dataclass
 from typing import Any, Iterator
 
 from ray.data._internal.execution.gpu.payloads import GroupedRangeData, RangeData
 from ray.data._internal.execution.gpu.transforms._runtime_support import (
-    CudfRuntimeContext,
+    CudfTransformRuntime,
+    is_positive_integral,
 )
 from ray.data._internal.execution.gpu.transforms._user_code import (
     invoke_user_code,
     iterate_user_code,
+    one_or_generator,
     raise_user_code_exception,
 )
 
@@ -23,23 +23,21 @@ MAP_GROUP_PARTITIONS_KIND = "map_group_partitions"
 
 
 @dataclass(frozen=True)
-class SortPartitionConfig:
+class _GroupKeysConfig:
     group_keys: tuple[str, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_keys", tuple(self.group_keys))
         if not self.group_keys:
-            raise ValueError("SortPartitionConfig requires group keys")
+            raise ValueError(f"{type(self).__name__} requires group keys")
 
 
-@dataclass(frozen=True)
-class BuildGroupBoundariesConfig:
-    group_keys: tuple[str, ...]
+class SortPartitionConfig(_GroupKeysConfig):
+    pass
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "group_keys", tuple(self.group_keys))
-        if not self.group_keys:
-            raise ValueError("BuildGroupBoundariesConfig requires group keys")
+
+class BuildGroupBoundariesConfig(_GroupKeysConfig):
+    pass
 
 
 @dataclass(frozen=True, eq=False)
@@ -52,11 +50,7 @@ class MapGroupPartitionsConfig:
         object.__setattr__(self, "group_keys", tuple(self.group_keys))
         if not self.group_keys:
             raise ValueError("MapGroupPartitionsConfig requires group keys")
-        if (
-            not isinstance(self.target_max_block_size, numbers.Integral)
-            or isinstance(self.target_max_block_size, bool)
-            or self.target_max_block_size <= 0
-        ):
+        if not is_positive_integral(self.target_max_block_size):
             raise ValueError("target_max_block_size must be a positive integer")
 
 
@@ -135,23 +129,9 @@ def split_output(batch: Any, target_bytes: int) -> Iterator[Any]:
         yield take(start, min(rows, start + rows_per_output))
 
 
-def _one_or_generator(value: Any) -> Iterator[Any]:
-    return value if isinstance(value, collections.abc.Iterator) else iter((value,))
-
-
-class SortPartitionRuntime:
-    def __init__(
-        self,
-        config: SortPartitionConfig,
-        context: CudfRuntimeContext,
-    ) -> None:
-        if not isinstance(config, SortPartitionConfig):
-            raise TypeError("sort_partition requires SortPartitionConfig")
-        self._config = config
-        self._context = context
-
-    def initialize(self) -> None:
-        self._context.ensure_cudf()
+class SortPartitionRuntime(CudfTransformRuntime):
+    config_type = SortPartitionConfig
+    kind = SORT_PARTITION_KIND
 
     def apply(self, value: Any, task_context: Any) -> RangeData:
         del task_context
@@ -179,21 +159,9 @@ class SortPartitionRuntime:
         return RangeData(value.partition, frame)
 
 
-class BuildGroupBoundariesRuntime:
-    def __init__(
-        self,
-        config: BuildGroupBoundariesConfig,
-        context: CudfRuntimeContext,
-    ) -> None:
-        if not isinstance(config, BuildGroupBoundariesConfig):
-            raise TypeError(
-                "build_group_boundaries requires BuildGroupBoundariesConfig"
-            )
-        self._config = config
-        self._context = context
-
-    def initialize(self) -> None:
-        self._context.ensure_cudf()
+class BuildGroupBoundariesRuntime(CudfTransformRuntime):
+    config_type = BuildGroupBoundariesConfig
+    kind = BUILD_GROUP_BOUNDARIES_KIND
 
     def apply(self, value: Any, task_context: Any) -> GroupedRangeData:
         del task_context
@@ -207,19 +175,9 @@ class BuildGroupBoundariesRuntime:
         return GroupedRangeData(value.partition, value.value, boundaries)
 
 
-class MapGroupPartitionsRuntime:
-    def __init__(
-        self,
-        config: MapGroupPartitionsConfig,
-        context: CudfRuntimeContext,
-    ) -> None:
-        if not isinstance(config, MapGroupPartitionsConfig):
-            raise TypeError("map_group_partitions requires MapGroupPartitionsConfig")
-        self._config = config
-        self._context = context
-
-    def initialize(self) -> None:
-        self._context.ensure_cudf()
+class MapGroupPartitionsRuntime(CudfTransformRuntime):
+    config_type = MapGroupPartitionsConfig
+    kind = MAP_GROUP_PARTITIONS_KIND
 
     def _apply_partition(self, value: GroupedRangeData) -> Iterator[Any]:
         if value.frame is None:
@@ -231,14 +189,10 @@ class MapGroupPartitionsRuntime:
             input_group_boundaries=value.boundaries,
         )
         result = invoke_user_code(self._config.partition_fn, value.frame, context)
-        for output in iterate_user_code(_one_or_generator(result)):
+        for output in iterate_user_code(one_or_generator(result)):
             try:
-                if not isinstance(output, self._context.cudf.DataFrame):
-                    raise TypeError(
-                        "The GPU map_group_partitions UDF must return cuDF "
-                        "DataFrames"
-                    )
-                output = output.reset_index(drop=True)
+                if isinstance(output, self._context.cudf.DataFrame):
+                    output = output.reset_index(drop=True)
                 for batch in split_output(
                     output, int(self._config.target_max_block_size)
                 ):

@@ -85,7 +85,12 @@ class FuseOperators(Rule):
         self._remove_output_deps(fused_dag)
         self._update_output_deps(fused_dag)
 
-        new_plan = PhysicalPlan(fused_dag, self._op_map, plan.context)
+        new_plan = PhysicalPlan(
+            fused_dag,
+            self._op_map,
+            plan.context,
+            gpu_fusion_state=plan.gpu_fusion_state,
+        )
         return new_plan
 
     def _remove_output_deps(self, op: PhysicalOperator) -> None:

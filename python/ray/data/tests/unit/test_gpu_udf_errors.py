@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pytest
@@ -195,6 +196,40 @@ def test_gpu_map_group_partitions_wraps_call_failure():
     with pytest.raises(UserCodeException) as exc_info:
         list(runtime.apply(_group_input(), None).value)
     assert isinstance(exc_info.value.__cause__, _UserError)
+
+
+def test_gpu_map_group_partitions_accepts_numpy_tensor_batch():
+    expected = np.arange(16, dtype=np.uint16).reshape(2, 8)
+
+    def return_tensor_batch(frame, context):
+        return {"input_ids": expected}
+
+    runtime = MapGroupPartitionsRuntime(
+        MapGroupPartitionsConfig(return_tensor_batch, ("key",), 8),
+        _FakeCudfContext(),
+    )
+
+    outputs = list(runtime.apply(_group_input(), None).value)
+
+    assert len(outputs) == 2
+    assert all(output["input_ids"].dtype == np.uint16 for output in outputs)
+    np.testing.assert_array_equal(
+        np.concatenate([output["input_ids"] for output in outputs]), expected
+    )
+
+
+def test_gpu_map_group_partitions_wraps_invalid_output_batch():
+    def return_invalid_batch(frame, context):
+        return object()
+
+    runtime = MapGroupPartitionsRuntime(
+        MapGroupPartitionsConfig(return_invalid_batch, ("key",), 1024),
+        _FakeCudfContext(),
+    )
+
+    with pytest.raises(UserCodeException) as exc_info:
+        list(runtime.apply(_group_input(), None).value)
+    assert isinstance(exc_info.value.__cause__, TypeError)
 
 
 def test_gpu_map_group_partitions_wraps_lazy_iterator_failure():

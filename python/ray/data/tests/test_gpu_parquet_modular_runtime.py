@@ -1,16 +1,19 @@
 import pickle
+from dataclasses import replace
 
 import pytest
 
 from ray.data._internal.execution.gpu.parquet_types import (
     ParquetFileWork,
     ParquetFooterSummary,
+    ParquetRangePlan,
     ParquetRangeWork,
     ParquetRowGroup,
     ParquetSourceIdentity,
 )
 from ray.data._internal.execution.gpu.payloads import RangeData, RangePartitionIdentity
 from ray.data._internal.execution.gpu.transforms.boundary import (
+    ExportRangeDataRuntime,
     decode_one_range_work,
     deserialize_range_work,
     serialize_range_work,
@@ -50,6 +53,71 @@ def test_range_work_is_serializable_and_boundary_round_trips():
     assert pickle.loads(pickle.dumps(work)) == work
     assert deserialize_range_work(serialize_range_work(work)) == work
     assert decode_one_range_work(work) is work
+
+
+def test_range_plan_rejects_missing_duplicate_and_overlapping_ownership():
+    first = ParquetRangeWork(
+        0,
+        "scheme",
+        0,
+        4,
+        (ParquetFileWork("file", _identity(), (0,)),),
+    )
+    second = ParquetRangeWork(
+        1,
+        "scheme",
+        5,
+        9,
+        (ParquetFileWork("file", _identity(), (0,)),),
+    )
+    plan = ParquetRangePlan("key", "scheme", (first, second), (1, 1, 1), 1, 0, 0)
+
+    with pytest.raises(ValueError, match="complete and unique"):
+        replace(plan, work=(first, replace(second, range_id=0)))
+    with pytest.raises(ValueError, match="ordered and disjoint"):
+        replace(plan, work=(first, replace(second, lower=4)))
+
+
+def test_range_export_consumes_all_output_before_publication():
+    import pandas as pd
+
+    def late_failure():
+        yield pd.DataFrame({"value": [1]})
+        raise RuntimeError("late range failure")
+
+    value = RangeData(RangePartitionIdentity(0, "scheme", 0, 1), late_failure())
+    with pytest.raises(RuntimeError, match="late range failure"):
+        ExportRangeDataRuntime().apply(value, None)
+
+
+def test_range_export_converts_every_batch_before_returning(monkeypatch):
+    import pandas as pd
+
+    from ray.data.block import BlockAccessor
+
+    batches = (
+        pd.DataFrame({"value": [1]}),
+        pd.DataFrame({"value": [2]}),
+    )
+    converted = []
+    original = BlockAccessor.batch_to_block
+
+    def fail_second_conversion(batch):
+        converted.append(batch)
+        if len(converted) == 2:
+            raise RuntimeError("second batch conversion failed")
+        return original(batch)
+
+    monkeypatch.setattr(BlockAccessor, "batch_to_block", fail_second_conversion)
+    value = RangeData(RangePartitionIdentity(0, "scheme", 0, 1), iter(batches))
+    sentinel = object()
+    returned = sentinel
+
+    with pytest.raises(RuntimeError, match="second batch conversion failed"):
+        returned = ExportRangeDataRuntime().apply(value, None)
+
+    assert returned is sentinel
+    assert converted == list(batches)
 
 
 def test_range_plan_is_disjoint_stable_and_tracks_overlapping_row_groups():
@@ -245,6 +313,94 @@ def _read_work():
         upper=5,
         files=(ParquetFileWork("file", _identity(), (0,)),),
     )
+
+
+@pytest.mark.parametrize("mutation", ("before", "during"))
+def test_local_identity_change_aborts_range_read(tmp_path, mutation):
+    path = tmp_path / "source.parquet"
+    path.write_bytes(b"planned")
+    cudf = _RetryingCudf([])
+    runtime = ReadParquetRangeRuntime(
+        ReadParquetRangeConfig(
+            source_kind="local",
+            region=None,
+            projection=("user", "value"),
+            range_key="user",
+            retried_io_errors=(),
+        ),
+        _ReadContext(cudf),
+    )
+    planned_identity = runtime._identity(str(path))
+    if mutation == "before":
+        path.write_bytes(b"changed-before-read")
+    else:
+        read_parquet = cudf.read_parquet
+
+        def mutate_during_read(*args, **kwargs):
+            frame = read_parquet(*args, **kwargs)
+            path.write_bytes(b"changed-during-read")
+            return frame
+
+        cudf.read_parquet = mutate_during_read
+    work = replace(
+        _read_work(),
+        files=(ParquetFileWork(str(path), planned_identity, (0,)),),
+    )
+
+    with pytest.raises(RuntimeError, match="changed after planning"):
+        list(runtime.apply(work, None).value)
+    assert cudf.calls == (0 if mutation == "before" else 1)
+
+
+class _IdentityS3Client:
+    def __init__(self, responses):
+        self._responses = iter(responses)
+
+    def head_object(self, *, Bucket, Key):
+        assert (Bucket, Key) == ("bucket", "key")
+        return next(self._responses)
+
+
+class _S3ReadContext(_ReadContext):
+    def __init__(self, cudf, responses):
+        super().__init__(cudf)
+        self.s3_client = _IdentityS3Client(responses)
+
+    def refresh_s3_for_task(self):
+        pass
+
+
+@pytest.mark.parametrize("mutation", ("before", "during"))
+def test_s3_identity_change_aborts_range_read(mutation):
+    unchanged = {
+        "ContentLength": 100,
+        "ETag": "planned",
+        "LastModified": "timestamp",
+    }
+    changed = {**unchanged, "ContentLength": 101}
+    responses = (changed,) if mutation == "before" else (unchanged, changed)
+    cudf = _RetryingCudf([])
+    runtime = ReadParquetRangeRuntime(
+        ReadParquetRangeConfig(
+            source_kind="s3",
+            region="us-east-1",
+            projection=("user", "value"),
+            range_key="user",
+            retried_io_errors=(),
+        ),
+        _S3ReadContext(cudf, responses),
+    )
+    planned_identity = ParquetSourceIdentity(
+        100, "etag:planned;last_modified:timestamp"
+    )
+    work = replace(
+        _read_work(),
+        files=(ParquetFileWork("bucket/key", planned_identity, (0,)),),
+    )
+
+    with pytest.raises(RuntimeError, match="changed after planning"):
+        list(runtime.apply(work, None).value)
+    assert cudf.calls == (0 if mutation == "before" else 1)
 
 
 def test_parquet_row_group_read_honors_retried_io_errors(monkeypatch):

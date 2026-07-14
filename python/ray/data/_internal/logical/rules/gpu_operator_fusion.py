@@ -1,25 +1,30 @@
-"""Physical materialization rule for declarative planned GPU regions."""
+"""Physical fusion for declarative, non-executable GPU fragments."""
 
 from __future__ import annotations
 
 from collections import Counter
-from typing import Dict, Iterable, List, Set
+from typing import Iterable
 
-from ray.data._internal.execution.gpu.composition import GPUCompositionError
+from ray.data._internal.execution.gpu.composition import (
+    GPUCompositionError,
+    GPUCompositionErrorReason,
+    foldable_edge,
+)
 from ray.data._internal.execution.gpu.operator import (
-    GPUOperator,
+    GPUBackendRefusal,
+    GPUOperatorCreationOptions,
     GPURequiredFusionError,
     PlannedGPUOperator,
-    create_gpu_operator,
+    materialize_gpu_operator,
 )
-from ray.data._internal.execution.gpu.operator_spec import GPUOperatorSpec
 from ray.data._internal.execution.gpu.region_compiler import compile_gpu_region
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.logical.interfaces import PhysicalPlan, Rule
+from ray.data._internal.planner.gpu_planning_errors import GPUPlanningErrorReason
 
 
 class FuseGPUOperators(Rule):
-    """Atomically compile and materialize complete planned GPU fusion groups."""
+    """Fold each maximal linear GPU chain and materialize it atomically."""
 
     @classmethod
     def dependencies(cls):
@@ -36,255 +41,172 @@ class FuseGPUOperators(Rule):
         return [FuseOperators]
 
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
-        planned = tuple(
-            op
-            for op in _reachable_operators(plan.dag)
-            if isinstance(op, PlannedGPUOperator)
-        )
         if not getattr(plan.context, "enable_gpu_operator_fusion", False):
-            if planned:
-                raise GPURequiredFusionError(
-                    "planned GPU operators require GPU physical fusion to be enabled"
-                )
             return plan
-        if not planned:
+        operators = tuple(_reachable_operators(plan.dag))
+        if not any(isinstance(operator, PlannedGPUOperator) for operator in operators):
             return plan
-
+        self._context = plan.context
+        self._state = plan.gpu_fusion_state
+        if self._state is None:
+            raise GPURequiredFusionError(
+                "strict GPU fusion requires plan-local fusion state"
+            )
         self._op_map = plan.op_map.copy()
-        self._consumer_counts = _consumer_counts(plan.dag)
-        self._planned_by_group = self._index_required_groups(planned)
-        fused_dag = self._fuse_from_downstream(plan.dag, plan.context)
-
-        leftovers = tuple(
-            op
-            for op in _reachable_operators(fused_dag)
-            if isinstance(op, PlannedGPUOperator)
+        self._consumer_counts = Counter(
+            input_operator
+            for operator in operators
+            for input_operator in operator.input_dependencies
         )
-        if leftovers:
-            groups = sorted(
-                {
-                    op.gpu_operator_spec.fusion_group_id or "<missing>"
-                    for op in leftovers
-                }
-            )
-            raise GPURequiredFusionError(
-                "required GPU fusion left non-executable planned operators: "
-                f"groups={groups!r}"
-            )
-
+        self._memo: dict[PhysicalOperator, PhysicalOperator] = {}
+        fused_dag = self._rewrite(plan.dag)
         _rebuild_output_dependencies(fused_dag)
-        return PhysicalPlan(fused_dag, self._op_map, plan.context)
-
-    def _index_required_groups(
-        self, planned: Iterable[PlannedGPUOperator]
-    ) -> Dict[str, Set[PlannedGPUOperator]]:
-        groups: Dict[str, Set[PlannedGPUOperator]] = {}
-        required_provenance: Dict[str, tuple[str, ...]] = {}
-        for op in planned:
-            spec = op.gpu_operator_spec
-            group_id = spec.fusion_group_id
-            if (
-                not spec.requires_complete_fusion
-                or not group_id
-                or not spec.required_logical_provenance
-            ):
-                raise GPURequiredFusionError(
-                    "every PlannedGPUOperator must declare a complete fusion group"
-                )
-            expected = required_provenance.setdefault(
-                group_id, spec.required_logical_provenance
-            )
-            if expected != spec.required_logical_provenance:
-                raise GPURequiredFusionError(
-                    f"fusion group {group_id!r} declares inconsistent required "
-                    "logical provenance"
-                )
-            if self._consumer_counts.get(op, 0) > 1:
-                raise GPURequiredFusionError(
-                    f"fusion group {group_id!r} is branched at {op.name!r}"
-                )
-            groups.setdefault(group_id, set()).add(op)
-        return groups
-
-    def _fuse_from_downstream(
-        self, op: PhysicalOperator, data_context
-    ) -> PhysicalOperator:
-        if isinstance(op, PlannedGPUOperator):
-            op = self._materialize_complete_group(op, data_context)
-        return self._rewrite_inputs(op, data_context)
-
-    def _rewrite_inputs(self, op: PhysicalOperator, data_context) -> PhysicalOperator:
-        op._input_dependencies = [
-            self._fuse_from_downstream(input_op, data_context)
-            for input_op in op.input_dependencies
-        ]
-        return op
-
-    def _materialize_complete_group(
-        self,
-        downstream: PlannedGPUOperator,
-        data_context,
-    ) -> PhysicalOperator:
-        group_id = downstream.gpu_operator_spec.fusion_group_id
-        assert group_id is not None
-        chain = self._full_chain_ending_at(downstream, group_id)
-        declared_nodes = self._planned_by_group[group_id]
-        if set(chain) != declared_nodes:
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} is not one complete linear chain; "
-                f"reachable={len(chain)}, declared={len(declared_nodes)}"
-            )
-
-        expected = downstream.gpu_operator_spec.required_logical_provenance
-        actual = tuple(
-            logical_id
-            for node in chain
-            for logical_id in node.gpu_operator_spec.logical_provenance
+        return PhysicalPlan(
+            fused_dag,
+            self._op_map,
+            plan.context,
+            gpu_fusion_state=self._state,
         )
-        if actual != expected:
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} has incomplete or reordered logical "
-                f"provenance: actual={actual!r}, required={expected!r}"
-            )
 
-        external_inputs = chain[0].input_dependencies
-        if len(external_inputs) != 1:
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} must have exactly one external input"
-            )
-        if not downstream.gpu_operator_spec.uses_terminal_output_adapter:
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} does not declare terminal egress"
-            )
+    def _rewrite(self, operator: PhysicalOperator) -> PhysicalOperator:
+        cached = self._memo.get(operator)
+        if cached is not None:
+            return cached
+        if isinstance(operator, PlannedGPUOperator):
+            chain = self._maximal_chain_ending_at(operator)
+            external_inputs = chain[0].input_dependencies
+            if len(external_inputs) != 1:
+                self._state.register_fusion_refusal(
+                    chain,
+                    GPUPlanningErrorReason.INCOMPLETE_FUSION,
+                    "a GPU region must have exactly one external input",
+                )
+                chain[0]._input_dependencies = [
+                    self._rewrite(item) for item in external_inputs
+                ]
+                for node in chain:
+                    self._memo[node] = node
+                return chain[-1]
+            rewritten_input = self._rewrite(external_inputs[0])
+            chain[0]._input_dependencies = [rewritten_input]
+            result = self._materialize(chain, rewritten_input)
+            for node in chain:
+                self._memo[node] = result if result is not chain[-1] else node
+            return result
+        operator._input_dependencies = [
+            self._rewrite(input_operator)
+            for input_operator in operator.input_dependencies
+        ]
+        self._memo[operator] = operator
+        return operator
 
-        try:
-            compiled = compile_gpu_region(
-                node.gpu_operator_spec for node in chain
-            )
-        except (GPUCompositionError, ValueError) as error:
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} could not be composed: {error}"
-            ) from error
-
-        self._validate_compiled_contract(compiled, group_id, expected)
-        creation_options = chain[0].gpu_creation_options
-        for node in chain[1:]:
-            creation_options = creation_options.for_fused_spec(
-                node.gpu_creation_options,
-                compiled,
-            )
-        try:
-            fused = create_gpu_operator(
-                compiled,
-                external_inputs[0],
-                data_context,
-                creation_options,
-            )
-        except Exception as error:
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} backend materialization failed: {error}"
-            ) from error
-
-        if not isinstance(fused, PhysicalOperator) or isinstance(
-            fused, PlannedGPUOperator
-        ):
-            raise GPURequiredFusionError(
-                "GPU operator factory must return an executable PhysicalOperator"
-            )
-        if not isinstance(fused, GPUOperator):
-            raise GPURequiredFusionError(
-                "GPU operator factory result must implement GPUOperator"
-            )
-        if fused.gpu_operator_spec is not compiled:
-            raise GPURequiredFusionError(
-                "GPU operator factory must retain the exact compiled specification"
-            )
-        if fused.execution_backend_name != compiled.execution_requirements.backend_name:
-            raise GPURequiredFusionError(
-                "GPU operator factory returned the wrong execution backend"
-            )
-        if fused.input_dependencies != [external_inputs[0]]:
-            raise GPURequiredFusionError(
-                "GPU operator factory changed the compiled region's external input"
-            )
-
-        logical_lineage = []
-        downstream_logical = self._op_map.get(downstream)
-        for node in chain:
-            if node._logical_operators:
-                logical_lineage.extend(node._logical_operators)
-            else:
-                logical = self._op_map.get(node)
-                if logical is not None:
-                    logical_lineage.append(logical)
-            self._op_map.pop(node, None)
-        if logical_lineage:
-            fused.set_logical_operators(*logical_lineage)
-        if downstream_logical is not None:
-            self._op_map[fused] = downstream_logical
-        return fused
-
-    def _full_chain_ending_at(
-        self,
-        downstream: PlannedGPUOperator,
-        group_id: str,
-    ) -> List[PlannedGPUOperator]:
+    def _maximal_chain_ending_at(
+        self, downstream: PlannedGPUOperator
+    ) -> list[PlannedGPUOperator]:
         chain = [downstream]
         cursor = downstream
         while len(cursor.input_dependencies) == 1:
             upstream = cursor.input_dependencies[0]
-            if not isinstance(upstream, PlannedGPUOperator):
-                break
-            if upstream.gpu_operator_spec.fusion_group_id != group_id:
-                break
-            if self._consumer_counts.get(upstream, 0) != 1:
+            if not (
+                isinstance(upstream, PlannedGPUOperator)
+                and self._consumer_counts.get(upstream, 0) == 1
+                and foldable_edge(upstream.gpu_operator_spec, cursor.gpu_operator_spec)
+            ):
                 break
             chain.insert(0, upstream)
             cursor = upstream
         return chain
 
-    @staticmethod
-    def _validate_compiled_contract(
-        compiled: GPUOperatorSpec,
-        group_id: str,
-        required_provenance: tuple[str, ...],
-    ) -> None:
-        if (
-            not compiled.requires_complete_fusion
-            or compiled.fusion_group_id != group_id
-            or compiled.required_logical_provenance != required_provenance
-            or compiled.logical_provenance != required_provenance
-            or not compiled.uses_terminal_output_adapter
-        ):
-            raise GPURequiredFusionError(
-                f"fusion group {group_id!r} compiled to an incomplete contract"
+    def _materialize(
+        self,
+        chain: list[PlannedGPUOperator],
+        external_input: PhysicalOperator,
+    ) -> PhysicalOperator:
+        try:
+            core = compile_gpu_region(node.gpu_operator_spec for node in chain)
+        except GPUCompositionError as error:
+            reason = (
+                GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS
+                if error.reason
+                in {
+                    GPUCompositionErrorReason.EXECUTION_INCOMPATIBLE,
+                    GPUCompositionErrorReason.INPUT_REQUIREMENTS_UNSATISFIED,
+                }
+                else GPUPlanningErrorReason.INCOMPLETE_FUSION
             )
+            self._state.register_fusion_refusal(chain, reason, str(error))
+            return chain[-1]
+        options = self._creation_options(chain, core)
+        try:
+            materialized = materialize_gpu_operator(
+                core,
+                external_input,
+                self._context,
+                options,
+            )
+        except GPUBackendRefusal as error:
+            self._state.register_fusion_refusal(
+                chain,
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                str(error),
+            )
+            return chain[-1]
+        fused = materialized.operator
+        logical_lineage = []
+        downstream_logical = self._op_map.get(chain[-1])
+        for node in chain:
+            lineage = tuple(node._logical_operators)
+            if not lineage:
+                logical = self._op_map.get(node)
+                if logical is not None:
+                    lineage = (logical,)
+            logical_lineage.extend(lineage)
+        if logical_lineage:
+            fused.set_logical_operators(*logical_lineage)
+        for node in chain:
+            self._op_map.pop(node, None)
+        if downstream_logical is None and logical_lineage:
+            downstream_logical = logical_lineage[-1]
+        if downstream_logical is not None:
+            self._op_map[fused] = downstream_logical
+        self._state.replace_physical(chain, fused)
+        self._state.register_materialized_region(
+            fused,
+            materialized.compiled_spec,
+            materialized.backend_name,
+            attested=materialized.attested,
+        )
+        return fused
+
+    @staticmethod
+    def _creation_options(
+        chain: list[PlannedGPUOperator], core
+    ) -> GPUOperatorCreationOptions:
+        options = chain[0].gpu_creation_options
+        for node in chain[1:]:
+            options = options.for_fused_spec(node.gpu_creation_options, core)
+        if options.name is None:
+            options = options.for_fused_spec(options, core)
+        return options
 
 
 def _reachable_operators(root: PhysicalOperator) -> Iterable[PhysicalOperator]:
-    visited: Set[PhysicalOperator] = set()
+    visited: set[PhysicalOperator] = set()
     stack = [root]
     while stack:
-        op = stack.pop()
-        if op in visited:
+        operator = stack.pop()
+        if operator in visited:
             continue
-        visited.add(op)
-        yield op
-        stack.extend(op.input_dependencies)
-
-
-def _consumer_counts(root: PhysicalOperator) -> Counter:
-    counts: Counter = Counter()
-    for op in _reachable_operators(root):
-        counts.update(op.input_dependencies)
-    return counts
+        visited.add(operator)
+        yield operator
+        stack.extend(operator.input_dependencies)
 
 
 def _rebuild_output_dependencies(root: PhysicalOperator) -> None:
     operators = list(_reachable_operators(root))
-    for op in operators:
-        op._output_dependencies = []
-    for op in operators:
-        for input_op in op.input_dependencies:
-            if op not in input_op._output_dependencies:
-                input_op._output_dependencies.append(op)
+    for operator in operators:
+        operator._output_dependencies = []
+    for operator in operators:
+        for input_operator in operator.input_dependencies:
+            if operator not in input_operator._output_dependencies:
+                input_operator._output_dependencies.append(operator)

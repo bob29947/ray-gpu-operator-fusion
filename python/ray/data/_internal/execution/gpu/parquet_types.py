@@ -112,12 +112,15 @@ class ParquetRangePlan:
     footer_bytes: int
     footer_elapsed_s: float
 
-
-__all__ = [
-    "ParquetFileWork",
-    "ParquetFooterSummary",
-    "ParquetRangePlan",
-    "ParquetRangeWork",
-    "ParquetRowGroup",
-    "ParquetSourceIdentity",
-]
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "work", tuple(self.work))
+        if not self.range_key or not self.scheme_id or not self.work:
+            raise ValueError("Parquet range plan requires a key, scheme, and work")
+        if any(item.scheme_id != self.scheme_id for item in self.work):
+            raise ValueError("Parquet range work has an inconsistent scheme")
+        if tuple(item.range_id for item in self.work) != tuple(range(len(self.work))):
+            raise ValueError("Parquet range work IDs must be complete and unique")
+        if any(
+            left.upper >= right.lower for left, right in zip(self.work, self.work[1:])
+        ):
+            raise ValueError("Parquet range ownership must be ordered and disjoint")

@@ -1,4 +1,6 @@
-"""Region fold shared by the physical fusion rule and contract tests."""
+"""Pure folds for native GPU chains and their external boundaries."""
+
+from __future__ import annotations
 
 from functools import reduce
 from typing import Iterable
@@ -6,42 +8,33 @@ from typing import Iterable
 from ray.data._internal.execution.gpu.composition import (
     GPUCompositionError,
     GPUCompositionErrorReason,
-    compose_gpu_operator_specs,
-    unresolved_validation_obligations,
+    fuse_gpu_operator_specs,
 )
-from ray.data._internal.execution.gpu.operator_spec import GPUOperatorSpec
+from ray.data._internal.execution.gpu.operator_spec import (
+    GPUOperatorSpec,
+    RAY_BLOCK_STREAM,
+)
 
 
-def compile_gpu_region(
-    specs: Iterable[GPUOperatorSpec],
-    *,
-    require_resolved_output: bool = True,
-) -> GPUOperatorSpec:
-    """Fold adjacent specs and optionally require a fully validated output.
-
-    Required physical fusion keeps the default and rejects any validation
-    obligation that would escape the one executable stage.
-    """
-
+def compile_gpu_region(specs: Iterable[GPUOperatorSpec]) -> GPUOperatorSpec:
     specs = tuple(specs)
     if not specs:
         raise ValueError("cannot compile an empty GPU region")
-    transforms = tuple(transform for spec in specs for transform in spec.transforms)
-    transform_ids = tuple(transform.transform_id for transform in transforms)
-    if len(transform_ids) != len(set(transform_ids)):
-        duplicates = sorted(
-            transform_id
-            for transform_id in set(transform_ids)
-            if transform_ids.count(transform_id) > 1
-        )
+    return reduce(fuse_gpu_operator_specs, specs)
+
+
+def compile_region(
+    core: GPUOperatorSpec,
+    ingress: GPUOperatorSpec,
+    egress: GPUOperatorSpec,
+) -> GPUOperatorSpec:
+    closed = compile_gpu_region((ingress, core, egress))
+    if (
+        closed.input_payload != RAY_BLOCK_STREAM
+        or closed.output_payload != RAY_BLOCK_STREAM
+    ):
         raise GPUCompositionError(
-            GPUCompositionErrorReason.DUPLICATE_TRANSFORM_ID,
-            f"duplicate transform ids: {duplicates!r}",
+            GPUCompositionErrorReason.PAYLOAD_INCOMPATIBLE,
+            "compiled GPU region must have Ray-block input and output boundaries",
         )
-    pending = unresolved_validation_obligations(transforms)
-    if require_resolved_output and pending:
-        raise GPUCompositionError(
-            GPUCompositionErrorReason.UNRESOLVED_VALIDATION_OBLIGATION,
-            f"compiled stage has unresolved obligations: {pending!r}",
-        )
-    return reduce(compose_gpu_operator_specs, specs)
+    return closed

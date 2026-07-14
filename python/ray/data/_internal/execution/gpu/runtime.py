@@ -1,4 +1,4 @@
-"""Backend-neutral actor-local runtime for an ordered GPU transform region."""
+"""Payload-exact runtime registry and actor-local GPU region execution."""
 
 from __future__ import annotations
 
@@ -6,13 +6,11 @@ import importlib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 
-from ray.data._internal.execution.gpu.boundary_adapters import (
-    GPUBoundaryDirection,
-    require_gpu_boundary_adapter,
-)
 from ray.data._internal.execution.gpu.operator_spec import (
     GPUOperatorSpec,
     GPUTransformSpec,
+    RAY_BLOCK_STREAM,
+    RuntimeKey,
 )
 from ray.data._internal.execution.interfaces import TaskContext
 from ray.data.block import Block
@@ -20,8 +18,6 @@ from ray.data.block import Block
 
 @dataclass
 class GPUTransformRuntimeContext:
-    """Mutable state shared by all transform runtimes in one actor process."""
-
     operator_spec: GPUOperatorSpec
     state: Dict[str, Any] = field(default_factory=dict)
 
@@ -40,42 +36,58 @@ class GPUTransformRuntime(Protocol):
 GPUTransformRuntimeFactory = Callable[
     [GPUTransformSpec, GPUTransformRuntimeContext], GPUTransformRuntime
 ]
-_GPU_TRANSFORM_RUNTIME_FACTORIES: Dict[str, GPUTransformRuntimeFactory] = {}
+GPUTransformConfigValidator = Callable[[Any], bool]
+
+
+@dataclass(frozen=True)
+class TransformRuntimeRegistration:
+    validate_config: GPUTransformConfigValidator = field(compare=False, repr=False)
+    factory: GPUTransformRuntimeFactory = field(compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not callable(self.validate_config):
+            raise TypeError("GPU transform config validator must be callable")
+        if not callable(self.factory):
+            raise TypeError("GPU transform runtime factory must be callable")
+
+
+_GPU_TRANSFORM_RUNTIMES: Dict[RuntimeKey, TransformRuntimeRegistration] = {}
 _BUILTINS_LOAD_ATTEMPTED = False
 
 
 def register_gpu_transform_runtime(
-    kind: str,
-    factory: GPUTransformRuntimeFactory,
+    key: RuntimeKey,
+    registration: TransformRuntimeRegistration,
     *,
     replace_existing: bool = False,
 ) -> None:
-    if not kind:
-        raise ValueError("GPU transform runtime kind must be nonempty")
-    if not callable(factory):
-        raise TypeError("GPU transform runtime factory must be callable")
-    if kind in _GPU_TRANSFORM_RUNTIME_FACTORIES and not replace_existing:
-        raise ValueError(f"GPU transform runtime already registered: {kind}")
-    _GPU_TRANSFORM_RUNTIME_FACTORIES[kind] = factory
+    _ensure_builtin_transform_runtimes_loaded()
+    if not isinstance(key, RuntimeKey):
+        raise TypeError("GPU transform runtime key must be a RuntimeKey")
+    if not isinstance(registration, TransformRuntimeRegistration):
+        raise TypeError(
+            "GPU transform runtime registration must be TransformRuntimeRegistration"
+        )
+    if key in _GPU_TRANSFORM_RUNTIMES and not replace_existing:
+        raise ValueError(f"GPU transform runtime already registered: {key!r}")
+    _GPU_TRANSFORM_RUNTIMES[key] = registration
 
 
 def unregister_gpu_transform_runtime(
-    kind: str,
+    key: RuntimeKey,
     *,
-    expected: GPUTransformRuntimeFactory | None = None,
-) -> GPUTransformRuntimeFactory:
-    """Remove one runtime implementation, with optional teardown guarding."""
-
+    expected: TransformRuntimeRegistration | None = None,
+) -> TransformRuntimeRegistration:
     try:
-        factory = _GPU_TRANSFORM_RUNTIME_FACTORIES[kind]
-    except KeyError as exc:
-        raise KeyError(f"GPU transform runtime is not registered: {kind}") from exc
-    if expected is not None and factory is not expected:
+        registration = _GPU_TRANSFORM_RUNTIMES[key]
+    except KeyError as error:
+        raise KeyError(f"GPU transform runtime is not registered: {key!r}") from error
+    if expected is not None and registration is not expected:
         raise ValueError(
-            f"GPU transform runtime {kind!r} is not the expected implementation"
+            f"GPU transform runtime {key!r} is not the expected implementation"
         )
-    del _GPU_TRANSFORM_RUNTIME_FACTORIES[kind]
-    return factory
+    del _GPU_TRANSFORM_RUNTIMES[key]
+    return registration
 
 
 def _ensure_builtin_transform_runtimes_loaded() -> None:
@@ -83,112 +95,79 @@ def _ensure_builtin_transform_runtimes_loaded() -> None:
     if _BUILTINS_LOAD_ATTEMPTED:
         return
     _BUILTINS_LOAD_ATTEMPTED = True
-    # The TFM runtime module is optional while the core package is unit tested in
-    # isolation.  Importing it here ensures registrations also happen in workers.
     try:
         importlib.import_module("ray.data._internal.execution.gpu.transforms.runtime")
-    except ModuleNotFoundError as exc:
-        if exc.name != "ray.data._internal.execution.gpu.transforms.runtime":
+    except ModuleNotFoundError as error:
+        if error.name != "ray.data._internal.execution.gpu.transforms.runtime":
             raise
 
 
-def supports_gpu_transform_runtime(transform_spec: GPUTransformSpec) -> bool:
-    """Return whether a transform can be constructed, without constructing it."""
+def get_gpu_transform_runtime_registration(
+    key: RuntimeKey,
+) -> TransformRuntimeRegistration | None:
+    _ensure_builtin_transform_runtimes_loaded()
+    return _GPU_TRANSFORM_RUNTIMES.get(key)
 
+
+def resolve_gpu_transform_runtime_registration(
+    transform_spec: GPUTransformSpec,
+) -> TransformRuntimeRegistration:
+    registration = get_gpu_transform_runtime_registration(transform_spec.runtime_key)
+    if registration is None:
+        raise ValueError(
+            "No GPU transform runtime registered for " f"{transform_spec.runtime_key!r}"
+        )
     try:
-        resolve_gpu_transform_runtime_factory(transform_spec)
+        valid = registration.validate_config(transform_spec.config)
+    except Exception as error:
+        raise ValueError(
+            f"Invalid config for GPU transform {transform_spec.runtime_key!r}: "
+            f"{error}"
+        ) from error
+    if valid is not True:
+        raise ValueError(
+            f"Invalid config for GPU transform {transform_spec.runtime_key!r}"
+        )
+    return registration
+
+
+def supports_gpu_transform_runtime(transform_spec: GPUTransformSpec) -> bool:
+    try:
+        resolve_gpu_transform_runtime_registration(transform_spec)
     except ValueError:
         return False
     return True
-
-
-def resolve_gpu_transform_runtime_factory(
-    transform_spec: GPUTransformSpec,
-) -> Optional[GPUTransformRuntimeFactory]:
-    """Resolve a registry factory without constructing its runtime.
-
-    ``None`` means the implementation is carried by ``config`` itself through
-    ``create_runtime`` or ``__call__``.  A returned registry callable is stored
-    in the physical transform so workers never need the driver's registry.
-    """
-
-    _ensure_builtin_transform_runtimes_loaded()
-    factory = _GPU_TRANSFORM_RUNTIME_FACTORIES.get(transform_spec.kind)
-    if factory is not None:
-        return factory
-    config = transform_spec.config
-    if callable(getattr(config, "create_runtime", None)) or callable(config):
-        return None
-    raise ValueError(
-        f"No GPU transform runtime registered for kind {transform_spec.kind!r}"
-    )
-
-
-class _CallableTransformRuntime:
-    def __init__(self, fn: Callable[[Any, TaskContext], Any]):
-        self._fn = fn
-
-    def initialize(self) -> None:
-        pass
-
-    def apply(self, value: Any, task_context: TaskContext) -> Any:
-        return self._fn(value, task_context)
 
 
 def create_gpu_transform_runtime(
     transform_spec: GPUTransformSpec,
     context: GPUTransformRuntimeContext,
 ) -> GPUTransformRuntime:
-    factory = resolve_gpu_transform_runtime_factory(transform_spec)
-    return _create_gpu_transform_runtime_from_resolved(
-        transform_spec,
-        context,
-        factory,
-    )
-
-
-def _create_gpu_transform_runtime_from_resolved(
-    transform_spec: GPUTransformSpec,
-    context: GPUTransformRuntimeContext,
-    factory: Optional[GPUTransformRuntimeFactory],
-) -> GPUTransformRuntime:
-    if factory is not None:
-        return factory(transform_spec, context)
-
-    config = transform_spec.config
-    create_runtime = getattr(config, "create_runtime", None)
-    if callable(create_runtime):
-        return create_runtime(context)
-    if callable(config):
-        return _CallableTransformRuntime(config)
-    raise ValueError(
-        f"No GPU transform runtime registered for kind {transform_spec.kind!r}"
-    )
+    registration = resolve_gpu_transform_runtime_registration(transform_spec)
+    return registration.factory(transform_spec, context)
 
 
 class GPURegionWorker:
-    """Runs the ordered transform list in one actor-local task."""
-
     def __init__(
         self,
         operator_spec: GPUOperatorSpec,
-        resolved_runtime_factories: Optional[
-            Tuple[Optional[GPUTransformRuntimeFactory], ...]
+        resolved_runtime_registrations: Optional[
+            Tuple[TransformRuntimeRegistration, ...]
         ] = None,
     ):
         self._operator_spec = operator_spec
-        if resolved_runtime_factories is None:
-            resolved_runtime_factories = tuple(
-                resolve_gpu_transform_runtime_factory(transform)
+        if resolved_runtime_registrations is None:
+            resolved_runtime_registrations = tuple(
+                resolve_gpu_transform_runtime_registration(transform)
                 for transform in operator_spec.transforms
             )
         else:
-            resolved_runtime_factories = tuple(resolved_runtime_factories)
-        if len(resolved_runtime_factories) != len(operator_spec.transforms):
+            resolved_runtime_registrations = tuple(resolved_runtime_registrations)
+        if len(resolved_runtime_registrations) != len(operator_spec.transforms):
             raise ValueError(
-                "resolved GPU runtime factories must align with transform specs"
+                "resolved GPU runtime registrations must align with transform specs"
             )
-        self._resolved_runtime_factories = resolved_runtime_factories
+        self._resolved_runtime_registrations = resolved_runtime_registrations
         self._context = GPUTransformRuntimeContext(operator_spec)
         self._transform_runtimes: List[GPUTransformRuntime] = []
         self._initialized = False
@@ -201,14 +180,10 @@ class GPURegionWorker:
         if self._initialized:
             return
         self._transform_runtimes = [
-            _create_gpu_transform_runtime_from_resolved(
-                transform,
-                self._context,
-                factory,
-            )
-            for transform, factory in zip(
+            registration.factory(transform, self._context)
+            for transform, registration in zip(
                 self._operator_spec.transforms,
-                self._resolved_runtime_factories,
+                self._resolved_runtime_registrations,
             )
         ]
         for runtime in self._transform_runtimes:
@@ -225,30 +200,32 @@ class GPURegionWorker:
 
 
 class GPURegionBlockTransform:
-    """Cloudpickle-friendly bridge used by a stock BlockMapTransformFn."""
-
-    def __init__(self, operator_spec: GPUOperatorSpec):
+    def __init__(
+        self,
+        operator_spec: GPUOperatorSpec,
+        resolved_runtime_registrations: Optional[
+            Tuple[TransformRuntimeRegistration, ...]
+        ] = None,
+    ):
+        if (
+            operator_spec.input_payload != RAY_BLOCK_STREAM
+            or operator_spec.output_payload != RAY_BLOCK_STREAM
+        ):
+            raise ValueError(
+                "GPURegionBlockTransform requires Ray-block input and output transforms"
+            )
         self._operator_spec = operator_spec
-        self._worker = GPURegionWorker(operator_spec)
-        self._input_adapter = require_gpu_boundary_adapter(
-            key=operator_spec.input_adapter_key,
-            direction=GPUBoundaryDirection.IMPORT,
-            external_payload=operator_spec.external_input_payload,
-            native_payload=operator_spec.native_input_payload,
-        )
-        self._output_adapter = require_gpu_boundary_adapter(
-            key=operator_spec.active_output_adapter_key,
-            direction=GPUBoundaryDirection.EXPORT,
-            external_payload=operator_spec.external_output_payload,
-            native_payload=operator_spec.native_output_payload,
+        self._worker = GPURegionWorker(
+            operator_spec,
+            resolved_runtime_registrations=resolved_runtime_registrations,
         )
 
     def initialize(self) -> None:
         self._worker.initialize()
 
     def __call__(
-        self, blocks: Iterable[Block], task_context: TaskContext
+        self,
+        blocks: Iterable[Block],
+        task_context: TaskContext,
     ) -> Iterable[Block]:
-        native_value = self._input_adapter.adapt(blocks, task_context)
-        output_value = self._worker.apply(native_value, task_context)
-        return self._output_adapter.adapt(output_value, task_context)
+        return self._worker.apply(blocks, task_context)

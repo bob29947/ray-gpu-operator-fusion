@@ -1,16 +1,15 @@
-import functools
-import inspect
+"""Independent GPU lowering for MapGroupPartitions."""
 
-from ray.data._internal.execution.gpu import (
-    CompletePartitionBundles,
-    GPUOperatorCreationOptions,
+from ray.data._internal.execution.gpu.operator import GPUOperatorCreationOptions
+from ray.data._internal.execution.gpu.operator_spec import (
+    GPUExecutionRequirements,
     GPUOperatorSpec,
     GPUTransformSpec,
-    KeysColocated,
-    PayloadKind,
-    RANGE_DATA_BOUNDARY_ADAPTER_KEY,
-    RANGE_DATA_TERMINAL_ADAPTER_KEY,
+    GROUPED_RANGE_DATA,
+    RANGE_DATA,
+    RANGE_PARTITION_DATA,
 )
+from ray.data._internal.execution.gpu.properties import KeysColocated
 from ray.data._internal.execution.gpu.transforms.grouped_partitions import (
     BUILD_GROUP_BOUNDARIES_KIND,
     MAP_GROUP_PARTITIONS_KIND,
@@ -24,7 +23,11 @@ from ray.data._internal.planner.gpu_lowering.interfaces import (
     GPULogicalAnalysis,
     GPULoweredOperator,
     GPULoweringContext,
+    GPURequirementDemand,
+    is_positive_int,
+    is_synchronous_callable,
 )
+from ray.data._internal.planner.gpu_requirement_analysis import RangePartitionDemand
 
 
 class GPUMapGroupPartitionsLowerer:
@@ -34,37 +37,38 @@ class GPUMapGroupPartitionsLowerer:
         del data_context
         if type(logical_op) is not MapGroupPartitions:
             return GPULogicalAnalysis(False, "logical_map_group_partitions")
-        partition_keys = (
-            (logical_op.key,)
-            if isinstance(logical_op.key, str)
-            else tuple(logical_op.key)
-        )
+        partition_keys = _partition_keys(logical_op)
         if not partition_keys or any(
             not isinstance(key, str) or not key for key in partition_keys
         ):
             return GPULogicalAnalysis(False, "group_keys")
         requested_partitions = logical_op.num_partitions
-        if requested_partitions is not None and (
-            not isinstance(requested_partitions, int)
-            or isinstance(requested_partitions, bool)
-            or requested_partitions <= 0
+        if requested_partitions is not None and not is_positive_int(
+            requested_partitions
         ):
             return GPULogicalAnalysis(False, "num_partitions")
-        if inspect.isclass(logical_op.fn) or not _is_synchronous(logical_op.fn):
+        if isinstance(logical_op.fn, type) or not is_synchronous_callable(
+            logical_op.fn
+        ):
             return GPULogicalAnalysis(
                 False,
                 "MapGroupPartitions requires a synchronous function, not a class",
             )
-        return GPULogicalAnalysis(
-            True,
-            None,
-            preserves_partitioning=bool(
-                logical_op.udf_properties is not None
-                and logical_op.udf_properties.preserves_partitioning
-            ),
-            partition_keys=partition_keys,
-            requested_partitions=requested_partitions,
+        return GPULogicalAnalysis(True)
+
+    def transfer_demands(
+        self,
+        logical_op: MapGroupPartitions,
+        downstream_demands: tuple[GPURequirementDemand, ...],
+        analysis: GPULogicalAnalysis,
+    ) -> tuple[tuple[GPURequirementDemand, ...], ...]:
+        del downstream_demands
+        if len(logical_op.input_dependencies) != 1:
+            return tuple(() for _ in logical_op.input_dependencies)
+        demand = RangePartitionDemand(
+            _partition_keys(logical_op), logical_op.num_partitions
         )
+        return ((demand,),)
 
     def lower(
         self, logical_op: MapGroupPartitions, context: GPULoweringContext
@@ -73,86 +77,47 @@ class GPUMapGroupPartitionsLowerer:
             raise TypeError(
                 "GPUMapGroupPartitionsLowerer requires an exact MapGroupPartitions"
             )
-        if context.source_artifacts is None:
-            raise ValueError("GPU MGP lowering requires Read source artifacts")
-        logical_group_keys = (
-            (logical_op.key,)
-            if isinstance(logical_op.key, str)
-            else tuple(logical_op.key)
-        )
-        if logical_group_keys != context.group_keys:
-            raise ValueError(
-                "MGP lowering context group_keys must match the logical operator"
-            )
-
-        transforms = [
-            GPUTransformSpec(
-                transform_id=context.transform_id(0, SORT_PARTITION_KIND),
-                kind=SORT_PARTITION_KIND,
-                input_payload=PayloadKind.RANGE_DATA,
-                output_payload=PayloadKind.RANGE_PARTITION_DATA,
-                config=SortPartitionConfig(context.group_keys),
-                requires_resolved_obligations=True,
-            ),
-            GPUTransformSpec(
-                transform_id=context.transform_id(1, BUILD_GROUP_BOUNDARIES_KIND),
-                kind=BUILD_GROUP_BOUNDARIES_KIND,
-                input_payload=PayloadKind.RANGE_PARTITION_DATA,
-                output_payload=PayloadKind.GROUPED_RANGE_DATA,
-                config=BuildGroupBoundariesConfig(context.group_keys),
-            ),
-            GPUTransformSpec(
-                transform_id=context.transform_id(2, MAP_GROUP_PARTITIONS_KIND),
-                kind=MAP_GROUP_PARTITIONS_KIND,
-                input_payload=PayloadKind.GROUPED_RANGE_DATA,
-                output_payload=PayloadKind.RANGE_DATA,
-                config=MapGroupPartitionsConfig(
-                    partition_fn=logical_op.fn,
-                    group_keys=context.group_keys,
-                    target_max_block_size=context.target_max_block_size,
+        requirements = context.execution_requirements or GPUExecutionRequirements()
+        group_keys = _partition_keys(logical_op)
+        spec = GPUOperatorSpec(
+            transforms=(
+                GPUTransformSpec(
+                    kind=SORT_PARTITION_KIND,
+                    input_payload=RANGE_DATA,
+                    output_payload=RANGE_PARTITION_DATA,
+                    config=SortPartitionConfig(group_keys),
+                ),
+                GPUTransformSpec(
+                    kind=BUILD_GROUP_BOUNDARIES_KIND,
+                    input_payload=RANGE_PARTITION_DATA,
+                    output_payload=GROUPED_RANGE_DATA,
+                    config=BuildGroupBoundariesConfig(group_keys),
+                ),
+                GPUTransformSpec(
+                    kind=MAP_GROUP_PARTITIONS_KIND,
+                    input_payload=GROUPED_RANGE_DATA,
+                    output_payload=RANGE_DATA,
+                    config=MapGroupPartitionsConfig(
+                        partition_fn=logical_op.fn,
+                        group_keys=group_keys,
+                        target_max_block_size=context.target_max_block_size,
+                    ),
                 ),
             ),
-        ]
-
-        spec = GPUOperatorSpec(
-            spec_instance_id=context.logical_node_id,
-            transforms=tuple(transforms),
-            external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
-            external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
-            native_input_payload=PayloadKind.RANGE_DATA,
-            native_output_payload=PayloadKind.RANGE_DATA,
-            input_adapter_key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
-            output_adapter_key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
-            terminal_output_adapter_key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
-            execution_requirements=context.execution_requirements,
-            input_requirements=(
-                KeysColocated(context.group_keys),
-                CompletePartitionBundles(),
-            ),
-            # MGP is the V1 GPU-region terminal.  No downstream GPU property
-            # is advertised until an explicit inter-stage boundary exists.
-            output_properties=(),
-            logical_provenance=(context.logical_node_id,),
+            execution_requirements=requirements,
+            input_requirements=(KeysColocated(group_keys),),
+            output_facts=(),
         )
-        downstream_context = context.for_lowered_output(spec)
         return GPULoweredOperator(
             spec=spec,
             creation_options=GPUOperatorCreationOptions(
                 name="GPUMapGroupPartitions",
                 target_max_block_size_override=context.target_max_block_size,
             ),
-            downstream_context=downstream_context,
-            source_artifacts=context.source_artifacts,
         )
 
 
-def _is_synchronous(callable_) -> bool:
-    if not callable(callable_):
-        return False
-    if inspect.isroutine(callable_) or isinstance(callable_, functools.partial):
-        function = callable_
-    else:
-        function = callable_.__call__
-    return not inspect.iscoroutinefunction(function) and not inspect.isasyncgenfunction(
-        function
+def _partition_keys(logical_op: MapGroupPartitions) -> tuple[str, ...]:
+    return (
+        (logical_op.key,) if isinstance(logical_op.key, str) else tuple(logical_op.key)
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numbers
 import os
 from contextlib import suppress
 from typing import Any, Optional
@@ -9,6 +10,20 @@ from typing import Any, Optional
 _GIB = 1024**3
 _KVIKIO_THREADS = 32
 _KVIKIO_TASK_SIZE = 16 * 1024**2
+
+
+def is_positive_integral(value: Any) -> bool:
+    return (
+        isinstance(value, numbers.Integral)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def require_config(config: Any, expected: type, kind: str) -> Any:
+    if not isinstance(config, expected):
+        raise TypeError(f"{kind} requires {expected.__name__}")
+    return config
 
 
 def live_rmm_pool_maximum(free_memory: int) -> int:
@@ -165,3 +180,15 @@ class CudfRuntimeContext:
         self._s3_client = client
         with suppress(Exception):
             previous_client.close()
+
+
+class CudfTransformRuntime:
+    config_type: type
+    kind: str
+
+    def __init__(self, config: Any, context: CudfRuntimeContext) -> None:
+        self._config = require_config(config, self.config_type, self.kind)
+        self._context = context
+
+    def initialize(self) -> None:
+        self._context.ensure_cudf()

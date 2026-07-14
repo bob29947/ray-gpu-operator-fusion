@@ -14,7 +14,7 @@ from ray.data._internal.execution.gpu.parquet_types import (
 )
 from ray.data._internal.execution.gpu.payloads import RangeData
 from ray.data._internal.execution.gpu.transforms._runtime_support import (
-    CudfRuntimeContext,
+    CudfTransformRuntime,
 )
 
 READ_PARQUET_RANGE_KIND = "read_parquet_range"
@@ -55,18 +55,11 @@ def _s3_uri(path: str) -> str:
     return "s3://" + urllib.parse.quote(path, safe="/")
 
 
-class ReadParquetRangeRuntime:
+class ReadParquetRangeRuntime(CudfTransformRuntime):
     """Read exact planned row groups and filter them to one disjoint range."""
 
-    def __init__(
-        self,
-        config: ReadParquetRangeConfig,
-        context: CudfRuntimeContext,
-    ) -> None:
-        if not isinstance(config, ReadParquetRangeConfig):
-            raise TypeError("read_parquet_range requires ReadParquetRangeConfig")
-        self._config = config
-        self._context = context
+    config_type = ReadParquetRangeConfig
+    kind = READ_PARQUET_RANGE_KIND
 
     def initialize(self) -> None:
         self._context.ensure_cudf(
@@ -175,5 +168,4 @@ class ReadParquetRangeRuntime:
         del task_context
         if not isinstance(value, ParquetRangeWork):
             raise TypeError("read_parquet_range expected native ParquetRangeWork")
-        work = value
-        return RangeData(work.partition, self._read_frames(work))
+        return RangeData(value.partition, self._read_frames(value))

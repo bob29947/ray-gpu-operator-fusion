@@ -35,6 +35,10 @@ def invoke_user_code(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
         raise_user_code_exception(error)
 
 
+def one_or_generator(value: Any) -> Iterator[Any]:
+    return value if isinstance(value, Iterator) else iter((value,))
+
+
 def iterate_user_code(values: Iterable[T]) -> Iterator[T]:
     """Iterate a lazy user result while wrapping failures raised after the call."""
 

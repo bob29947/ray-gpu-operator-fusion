@@ -35,7 +35,6 @@ from ray.data._internal.logical.operators import (
     Join,
     Limit,
     ListFiles,
-    MapGroupPartitions,
     Mix,
     Project,
     Read,
@@ -200,6 +199,7 @@ class Planner:
         self._supports_checkpointing = False
         self._plan_fns_for_checkpointing = {}
         self._gpu_required_fusion_planner = None
+        self._gpu_fusion_state = None
 
     def plan(
         self, logical_plan: LogicalPlan
@@ -209,11 +209,23 @@ class Planner:
         # Planner instances can be reused. GPU analysis is immutable and
         # plan-local; it runs after logical optimization and before lowering.
         self._gpu_required_fusion_planner = None
+        self._gpu_fusion_state = None
         if logical_plan.context.enable_gpu_operator_fusion:
+            from ray.data._internal.execution.gpu.planning_state import (
+                GPUFusionPlanState,
+            )
             from ray.data._internal.planner.gpu_plan_provider import (
                 create_gpu_required_fusion_planner,
             )
 
+            self._gpu_fusion_state = GPUFusionPlanState(enabled=True)
+            terminal = (
+                (logical_plan.dag,) if isinstance(logical_plan.dag, Write) else ()
+            )
+            self._gpu_fusion_state.initialize_logical_universe(
+                logical_plan.dag,
+                terminal_logical=terminal,
+            )
             self._gpu_required_fusion_planner = create_gpu_required_fusion_planner(
                 logical_plan.dag, logical_plan.context
             )
@@ -248,7 +260,12 @@ class Planner:
         physical_dag, op_map = self._plan_recursively(
             logical_plan.dag, logical_plan.context
         )
-        physical_plan = PhysicalPlan(physical_dag, op_map, logical_plan.context)
+        physical_plan = PhysicalPlan(
+            physical_dag,
+            op_map,
+            logical_plan.context,
+            gpu_fusion_state=self._gpu_fusion_state,
+        )
         return physical_plan, callbacks
 
     def get_plan_fn(self, logical_op: LogicalOperator) -> PlanLogicalOpFn:
@@ -279,25 +296,6 @@ class Planner:
             A tuple of the physical operator corresponding to the logical operator, and
             a mapping from physical to logical operators.
         """
-        # Required GPU planning must claim its exact component before stock
-        # children are built, otherwise its consumed subtree would be discarded.
-        if self._gpu_required_fusion_planner is not None:
-            planned = self._gpu_required_fusion_planner.try_plan(
-                logical_op, data_context
-            )
-            if planned is not None:
-                return planned.root, dict(planned.op_map)
-
-        if type(logical_op) is MapGroupPartitions:
-            from ray.data._internal.planner.gpu_plan_provider import (
-                raise_mgp_without_required_gpu_fusion,
-            )
-
-            raise_mgp_without_required_gpu_fusion(
-                logical_op,
-                gpu_enabled=data_context.enable_gpu_operator_fusion,
-            )
-
         op_map: Dict[PhysicalOperator, LogicalOperator] = {}
 
         # Plan the input dependencies first.
@@ -307,7 +305,61 @@ class Planner:
             physical_children.append(physical_child)
             op_map.update(child_op_map)
 
-        plan_fn = self.get_plan_fn(logical_op)
+        gpu_decline = None
+        if self._gpu_required_fusion_planner is not None and not isinstance(
+            logical_op, Write
+        ):
+            from ray.data._internal.planner.gpu_lowering.interfaces import (
+                GPUDecline,
+                GPUInvalid,
+                GPUPlan,
+            )
+            from ray.data._internal.planner.gpu_planning_errors import GPUPlanningError
+
+            decision = self._gpu_required_fusion_planner.plan_node(
+                logical_op,
+                data_context,
+            )
+            if isinstance(decision, GPUInvalid):
+                raise GPUPlanningError(
+                    decision.reason,
+                    decision.detail,
+                    logical_ops=(f"{type(logical_op).__name__}({logical_op.name})",),
+                )
+            if isinstance(decision, GPUPlan):
+                planned = self._gpu_required_fusion_planner.materialize_planned_node(
+                    logical_op,
+                    physical_children,
+                    decision,
+                    data_context,
+                )
+                op_map.update(planned.op_map)
+                if self._gpu_fusion_state is not None:
+                    for physical in planned.op_map:
+                        if isinstance(physical, InputDataBuffer):
+                            self._gpu_fusion_state.register_infrastructure(physical)
+                return planned.root, op_map
+            assert isinstance(decision, GPUDecline)
+            gpu_decline = decision
+            self._gpu_required_fusion_planner.record_stock_fallback(logical_op)
+
+        try:
+            plan_fn = self.get_plan_fn(logical_op)
+        except ValueError as error:
+            if gpu_decline is None:
+                raise
+            from ray.data._internal.planner.gpu_planning_errors import (
+                GPUPlanningError,
+                GPUPlanningErrorReason,
+            )
+
+            raise GPUPlanningError(
+                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                f"operator={type(logical_op).__name__}({logical_op.name}); "
+                f"GPU lowering declined ({gpu_decline.detail}) and no stock "
+                "physical lowerer exists",
+                logical_ops=(f"{type(logical_op).__name__}({logical_op.name})",),
+            ) from error
         # We will call `set_logical_operators()` in the following for-loop,
         # no need to do it here.
         physical_op = plan_fn(logical_op, physical_children, data_context)
@@ -316,6 +368,7 @@ class Planner:
         # At this point, all physical operators without logical operators set
         # must have been created by the current logical operator.
         queue = [physical_op]
+        created_physical_ops = []
         while queue:
             curr_physical_op = queue.pop()
             # Once we find an operator with a logical operator set, we can stop.
@@ -323,12 +376,22 @@ class Planner:
                 break
 
             curr_physical_op.set_logical_operators(logical_op)
+            created_physical_ops.append(curr_physical_op)
             # Add this operator to the op_map so optimizer can find it
             op_map[curr_physical_op] = logical_op
             queue.extend(curr_physical_op.input_dependencies)
 
         # Also add the final operator (in case the loop didn't catch it)
         op_map[physical_op] = logical_op
+        if gpu_decline is not None and self._gpu_fusion_state is not None:
+            self._gpu_fusion_state.register_stock_fallback(
+                logical_op,
+                gpu_decline.reason,
+                gpu_decline.detail,
+                tuple(created_physical_ops) or (physical_op,),
+            )
+        if isinstance(logical_op, Write) and self._gpu_fusion_state is not None:
+            self._gpu_fusion_state.register_terminal(logical_op, physical_op)
         return physical_op, op_map
 
     def _create_checkpoint_callback(

@@ -7625,6 +7625,13 @@ class Dataset:
         if preserve_order or self._logical_plan.require_preserve_order():
             executor._options.preserve_order = True
 
+        if self._context.enable_gpu_operator_fusion:
+            from ray.data._internal.execution.gpu.cover import (
+                validate_gpu_execution_plan,
+            )
+
+            validate_gpu_execution_plan(physical_plan)
+
         return executor.execute(dag, initial_stats=stats, callbacks=callbacks)
 
     def _build_bundle_iterator(

@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import collections
-import collections.abc
-import numbers
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator
 
 from ray.data._internal.execution.gpu.payloads import RangeData
 from ray.data._internal.execution.gpu.transforms._runtime_support import (
     CudfRuntimeContext,
+    CudfTransformRuntime,
+    is_positive_integral,
+    require_config,
 )
 from ray.data._internal.execution.gpu.transforms._user_code import (
     invoke_user_code,
     iterate_user_code,
+    one_or_generator,
     raise_user_code_exception,
 )
 
@@ -35,26 +37,19 @@ class MapBatchesConfig:
     fn_constructor_kwargs: tuple[tuple[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "fn_args", tuple(self.fn_args))
-        object.__setattr__(self, "fn_kwargs", tuple(self.fn_kwargs))
-        object.__setattr__(self, "fn_constructor_args", tuple(self.fn_constructor_args))
-        object.__setattr__(
-            self, "fn_constructor_kwargs", tuple(self.fn_constructor_kwargs)
-        )
-        if (
-            not isinstance(self.batch_size, numbers.Integral)
-            or isinstance(self.batch_size, bool)
-            or self.batch_size <= 0
+        for name in (
+            "fn_args",
+            "fn_kwargs",
+            "fn_constructor_args",
+            "fn_constructor_kwargs",
         ):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+        if not is_positive_integral(self.batch_size):
             raise ValueError("MapBatchesConfig.batch_size must be a positive integer")
-        if len({key for key, _ in self.fn_kwargs}) != len(self.fn_kwargs):
-            raise ValueError("MapBatchesConfig.fn_kwargs contains duplicate keys")
-        if len({key for key, _ in self.fn_constructor_kwargs}) != len(
-            self.fn_constructor_kwargs
-        ):
-            raise ValueError(
-                "MapBatchesConfig.fn_constructor_kwargs contains duplicate keys"
-            )
+        for name in ("fn_kwargs", "fn_constructor_kwargs"):
+            values = getattr(self, name)
+            if len({key for key, _ in values}) != len(values):
+                raise ValueError(f"MapBatchesConfig.{name} contains duplicate keys")
 
     @classmethod
     def from_logical_op(cls, op: Any) -> "MapBatchesConfig":
@@ -122,24 +117,20 @@ def rebatched_frames(
         yield take(available)
 
 
-def one_or_generator(value: Any) -> Iterator[Any]:
-    return value if isinstance(value, collections.abc.Iterator) else iter((value,))
+class MapBatchesRuntime(CudfTransformRuntime):
+    config_type = MapBatchesConfig
+    kind = MAP_BATCHES_KIND
 
-
-class MapBatchesRuntime:
     def __init__(
         self,
         config: MapBatchesConfig,
         context: CudfRuntimeContext,
     ) -> None:
-        if not isinstance(config, MapBatchesConfig):
-            raise TypeError("map_batches requires MapBatchesConfig")
-        self._config = config
-        self._context = context
+        super().__init__(config, context)
         self._udf: Any = None
 
     def initialize(self) -> None:
-        self._context.ensure_cudf()
+        super().initialize()
         self._udf = invoke_user_code(
             self._config.udf_cls,
             *self._config.fn_constructor_args,
@@ -177,11 +168,9 @@ class MapBatchesRuntime:
 
 class ValidateRangeOwnershipRuntime:
     def __init__(self, config: ValidateRangeOwnershipConfig) -> None:
-        if not isinstance(config, ValidateRangeOwnershipConfig):
-            raise TypeError(
-                "validate_range_ownership requires ValidateRangeOwnershipConfig"
-            )
-        self._config = config
+        self._config = require_config(
+            config, ValidateRangeOwnershipConfig, VALIDATE_RANGE_OWNERSHIP_KIND
+        )
 
     def initialize(self) -> None:
         pass

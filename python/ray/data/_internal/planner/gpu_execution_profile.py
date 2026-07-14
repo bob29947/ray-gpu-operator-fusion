@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numbers
 from dataclasses import replace
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from ray.data._internal.compute import ActorPoolStrategy
 from ray.data._internal.execution.gpu.operator_spec import (
@@ -19,6 +19,20 @@ from ray.data._internal.planner.gpu_planning_errors import (
 from ray.data.context import DataContext
 
 
+_UNSUPPORTED = GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+_CONFLICTING = GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS
+
+
+def _unsupported(consumer: str, detail: str) -> GPUPlanningError:
+    return GPUPlanningError(_UNSUPPORTED, f"consumer={consumer}; {detail}")
+
+
+def _valid_mapping(value: Any, valid_value: Callable[[Any], bool]) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and valid_value(item) for key, item in value.items()
+    )
+
+
 def canonical_gpu_execution_requirements(
     *,
     compute: Any,
@@ -29,10 +43,7 @@ def canonical_gpu_execution_requirements(
     """Return the effective immutable profile for one GPU unary operator."""
 
     def unsupported(detail: str) -> None:
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-            f"consumer={consumer}; {detail}",
-        )
+        raise _unsupported(consumer, detail)
 
     if not isinstance(compute, ActorPoolStrategy):
         unsupported("GPU execution requires ActorPoolStrategy")
@@ -61,68 +72,49 @@ def canonical_gpu_execution_requirements(
     else:
         maximum = int(compute.max_size)
 
-    remote = dict(resources)
-    if remote.get("max_concurrency", 1) != 1:
+    remaining = dict(resources)
+    max_concurrency = remaining.pop("max_concurrency", 1)
+    num_gpus = remaining.pop("num_gpus", None)
+    num_cpus = remaining.pop("num_cpus", 1)
+    memory = remaining.pop("memory", None)
+    custom = remaining.pop("resources", None) or {}
+    accelerator_type = remaining.pop("accelerator_type", None)
+    runtime_env = remaining.pop("runtime_env", None)
+    scheduling = remaining.pop("scheduling_strategy", None)
+    labels = remaining.pop("label_selector", None) or {}
+    max_restarts = remaining.pop("max_restarts", -1)
+    max_task_retries = remaining.pop("max_task_retries", -1 if max_restarts != 0 else 0)
+    if max_concurrency != 1:
         unsupported("max_concurrency must be 1")
-    num_gpus = remote.get("num_gpus")
     if (
         not isinstance(num_gpus, numbers.Real)
         or isinstance(num_gpus, bool)
         or float(num_gpus) != 1.0
     ):
         unsupported("GPU MapBatches must request exactly num_gpus=1")
+    if remaining:
+        unsupported(f"unsupported GPU actor options: {sorted(remaining)!r}")
 
-    supported_options = {
-        "num_cpus",
-        "num_gpus",
-        "memory",
-        "resources",
-        "accelerator_type",
-        "runtime_env",
-        "scheduling_strategy",
-        "label_selector",
-        "max_concurrency",
-        "max_restarts",
-        "max_task_retries",
-    }
-    unknown = set(remote) - supported_options
-    if unknown:
-        unsupported(f"unsupported GPU actor options: {sorted(unknown)!r}")
-
-    scheduling = remote.get("scheduling_strategy")
     if scheduling is not None and not isinstance(scheduling, str):
         unsupported("only canonical string scheduling strategies are supported")
-    labels = remote.get("label_selector") or {}
-    if not (
-        isinstance(labels, dict)
-        and all(isinstance(k, str) and isinstance(v, str) for k, v in labels.items())
-    ):
+    if not _valid_mapping(labels, lambda value: isinstance(value, str)):
         unsupported("label_selector must map strings to strings")
-    custom = remote.get("resources") or {}
-    if not (
-        isinstance(custom, dict)
-        and all(
-            isinstance(k, str)
-            and isinstance(v, numbers.Real)
-            and not isinstance(v, bool)
-            for k, v in custom.items()
-        )
+    if not _valid_mapping(
+        custom,
+        lambda value: isinstance(value, numbers.Real) and not isinstance(value, bool),
     ):
         unsupported("custom resources must map strings to numeric values")
-    memory = remote.get("memory")
     if memory is not None and (
         not isinstance(memory, numbers.Real) or isinstance(memory, bool)
     ):
         unsupported("memory must be numeric")
 
-    max_restarts = remote.get("max_restarts", -1)
-    max_task_retries = remote.get("max_task_retries", -1 if max_restarts != 0 else 0)
     actor_errors = data_context.actor_task_retry_on_errors
-    if not isinstance(actor_errors, bool):
-        actor_errors = tuple(actor_errors)
+    actor_errors = (
+        actor_errors if isinstance(actor_errors, bool) else tuple(actor_errors)
+    )
     map_errors = data_context.retried_map_errors
-    if not isinstance(map_errors, bool):
-        map_errors = tuple(map_errors)
+    map_errors = map_errors if isinstance(map_errors, bool) else tuple(map_errors)
     try:
         retry_policy = GPUStageRetryPolicy(
             actor_max_restarts=max_restarts,
@@ -136,30 +128,44 @@ def canonical_gpu_execution_requirements(
         )
     except (TypeError, ValueError) as error:
         unsupported(f"invalid GPU retry policy: {error}")
-        raise AssertionError("unreachable")
 
     return GPUExecutionRequirements(
-        backend_name="actor_pool",
+        backend_keys=frozenset(("actor_pool",)),
         compatibility_key=GPUExecutionCompatibilityKey(
             min_workers=minimum,
             initial_workers=initial,
             max_workers=maximum,
             max_tasks_in_flight_per_worker=1,
             max_udf_concurrency=1,
-            num_cpus=float(remote.get("num_cpus", 1)),
+            num_cpus=float(num_cpus),
             num_gpus=1.0,
             memory=float(memory) if memory is not None else None,
             custom_resources=tuple(
                 sorted((key, float(value)) for key, value in custom.items())
             ),
-            accelerator_type=remote.get("accelerator_type"),
+            accelerator_type=accelerator_type,
             scheduling_strategy=scheduling,
             label_selector=tuple(sorted(labels.items())),
-            runtime_env_serialized=_runtime_env_serialized(remote.get("runtime_env")),
+            runtime_env_serialized=_runtime_env_serialized(runtime_env),
             retry_policy=retry_policy,
             actor_bootstrap=(("allocator", "rmm-pool-v1"),),
         ),
     )
+
+
+def _reconcile_read_constraint(
+    name: str,
+    read_value: Any,
+    map_value: Any,
+    consumer: str,
+) -> Any:
+    if read_value is not None and map_value is not None and read_value != map_value:
+        raise GPUPlanningError(
+            _CONFLICTING,
+            f"consumer={consumer}; Read and GPU MapBatches specify conflicting "
+            f"{name} values: {read_value!r} != {map_value!r}",
+        )
+    return map_value if read_value is None else read_value
 
 
 def reconcile_read_remote_args(
@@ -170,60 +176,50 @@ def reconcile_read_remote_args(
 ) -> GPUExecutionRequirements:
     """Fold specialized Read placement constraints into the component profile."""
 
-    unknown = set(read_remote_args) - {"scheduling_strategy", "label_selector"}
-    if unknown:
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-            f"consumer={consumer}; unsupported specialized Read remote args: "
-            f"{sorted(unknown)!r}",
+    remaining = dict(read_remote_args)
+    scheduling = remaining.pop("scheduling_strategy", None)
+    raw_labels = remaining.pop("label_selector", None)
+    if remaining:
+        raise _unsupported(
+            consumer,
+            f"unsupported specialized Read remote args: {sorted(remaining)!r}",
         )
     key = requirements.compatibility_key
-    scheduling = read_remote_args.get("scheduling_strategy")
+    if key is None:
+        raise _unsupported(
+            consumer,
+            "specialized Read requires a concrete GPU execution profile",
+        )
+
     if scheduling is not None and not isinstance(scheduling, str):
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-            f"consumer={consumer}; Read scheduling_strategy must be a string",
-        )
-    if (
-        scheduling is not None
-        and key.scheduling_strategy is not None
-        and scheduling != key.scheduling_strategy
-    ):
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS,
-            f"consumer={consumer}; Read and GPU MapBatches specify conflicting "
-            f"scheduling_strategy values: {scheduling!r} != "
-            f"{key.scheduling_strategy!r}",
-        )
+        raise _unsupported(consumer, "Read scheduling_strategy must be a string")
+    scheduling = _reconcile_read_constraint(
+        "scheduling_strategy",
+        scheduling,
+        key.scheduling_strategy,
+        consumer,
+    )
 
-    raw_labels = read_remote_args.get("label_selector")
-    if raw_labels is not None and not (
-        isinstance(raw_labels, dict)
-        and all(
-            isinstance(label, str) and isinstance(value, str)
-            for label, value in raw_labels.items()
-        )
+    if raw_labels is not None and not _valid_mapping(
+        raw_labels, lambda value: isinstance(value, str)
     ):
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-            f"consumer={consumer}; Read label_selector must map strings to strings",
+        raise _unsupported(
+            consumer,
+            "Read label_selector must map strings to strings",
         )
-    read_labels = tuple(sorted((raw_labels or {}).items()))
-    if read_labels and key.label_selector and read_labels != key.label_selector:
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS,
-            f"consumer={consumer}; Read and GPU MapBatches specify conflicting "
-            f"label_selector values: {read_labels!r} != {key.label_selector!r}",
-        )
-
+    read_labels = tuple(sorted((raw_labels or {}).items())) or None
+    labels = _reconcile_read_constraint(
+        "label_selector",
+        read_labels,
+        key.label_selector or None,
+        consumer,
+    )
     return replace(
         requirements,
         compatibility_key=replace(
             key,
-            scheduling_strategy=(
-                key.scheduling_strategy if scheduling is None else scheduling
-            ),
-            label_selector=key.label_selector or read_labels,
+            scheduling_strategy=scheduling,
+            label_selector=labels or (),
         ),
     )
 
@@ -245,7 +241,4 @@ def _runtime_env_serialized(value: Any) -> Optional[str]:
     return runtime_env.serialize()
 
 
-__all__ = [
-    "canonical_gpu_execution_requirements",
-    "reconcile_read_remote_args",
-]
+__all__ = ["canonical_gpu_execution_requirements", "reconcile_read_remote_args"]

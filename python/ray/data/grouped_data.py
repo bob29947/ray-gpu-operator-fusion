@@ -349,21 +349,24 @@ class GroupedData:
     ) -> "Dataset":
         """Apply a GPU function to partitions containing complete groups.
 
-        This is an explicit opt-in fast path for exactly one supported Parquet
-        read, one GPU-eligible :meth:`~ray.data.Dataset.map_batches`, and this
-        ``map_group_partitions`` operation. Ray plans disjoint ranges from the
+        This is an explicit opt-in fast path for a supported Parquet read, one or
+        more partition-preserving GPU-eligible
+        :meth:`~ray.data.Dataset.map_batches` operations, this
+        ``map_group_partitions`` operation, and optional GPU-eligible
+        ``map_batches`` operations afterward. Ray plans disjoint ranges from the
         leading group key, sorts each complete partition by all group keys, and
         invokes ``fn`` for every nonempty partition. ``fn`` receives the cuDF
         partition and a :class:`MapGroupPartitionsContext`.
 
         Before constructing the Dataset, set
         ``DataContext.get_current().enable_gpu_operator_fusion = True``. A GPU
-        immediately upstream ``map_batches`` must pass
+        ``map_batches`` between the Read and this operation must each pass
         ``UDFProperties(preserves_partitioning=True)``. The backend validates
-        that its output rows remain in the assigned leading-key range. Unlike
+        after every such map that output rows remain in the assigned leading-key
+        range. Unlike
         :meth:`map_groups`, this API has no general-purpose stock fallback and
         raises an actionable error unless the physical optimizer can fuse the
-        complete three-operator GPU region.
+        complete GPU region.
 
         Ray may invoke ``fn`` again after a retry or actor restart. Side effects
         therefore have at-least-once semantics; execution is not exactly once.
@@ -374,8 +377,9 @@ class GroupedData:
 
         Args:
             fn: A function that accepts a cuDF partition and a
-                :class:`MapGroupPartitionsContext`, and returns one output batch or
-                an iterator of cuDF output batches.
+                :class:`MapGroupPartitionsContext`, and returns one Ray Data batch
+                or an iterator of batches. A downstream fused ``map_batches`` with
+                ``batch_format="cudf"`` requires cuDF output batches.
             udf_properties: Optional semantic assertions about ``fn``. These
                 assertions do not change ordinary execution behavior. The GPU
                 planner may use them to prove whether partitioning properties are

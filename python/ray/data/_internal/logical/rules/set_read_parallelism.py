@@ -3,7 +3,6 @@ import math
 from typing import Optional, Tuple, Union
 
 from ray import available_resources as ray_available_resources
-from ray.data._internal.execution.gpu.operator import GPUOperator
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.logical.interfaces import PhysicalPlan, Rule
@@ -110,16 +109,18 @@ class SetReadParallelismRule(Rule):
         return [InheritTargetMaxBlockSizeRule]
 
     def apply(self, plan: PhysicalPlan) -> PhysicalPlan:
+        planned_gpu_type = ()
+        if plan.context.enable_gpu_operator_fusion:
+            from ray.data._internal.execution.gpu.operator import PlannedGPUOperator
+
+            planned_gpu_type = PlannedGPUOperator
         ops = [plan.dag]
 
         while len(ops) > 0:
             op = ops.pop(0)
             if isinstance(op, InputDataBuffer):
                 continue
-            if (
-                isinstance(op, GPUOperator)
-                and op.gpu_operator_spec.owns_input_parallelism
-            ):
+            if isinstance(op, planned_gpu_type) and op.owns_input_parallelism:
                 # The GPU source spec owns the range count and descriptor
                 # bundles. Stock Read splitting must not reinterpret it before
                 # required physical fusion materializes the complete region.
