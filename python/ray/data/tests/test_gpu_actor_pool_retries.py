@@ -1,4 +1,4 @@
-"""CPU-only retry coverage for the sealed GPU ActorPool stage.
+"""CPU-only retry coverage for a complete required-fusion ActorPool stage.
 
 These tests deliberately use test payload adapters and ``num_gpus=0``.  They
 exercise the real ``ActorPoolGPUOperator`` and stock ``StreamingExecutor``
@@ -115,7 +115,7 @@ def _retry_policy(
     )
 
 
-def _sealed_test_spec(
+def _complete_required_test_spec(
     config,
     context: DataContext,
     *,
@@ -157,19 +157,25 @@ def _sealed_test_spec(
             compatibility_key=compatibility_key
         ),
         logical_provenance=("TestGPUStage",),
-    )
-    return spec.for_gate2_stage(
-        specialized_read_parallelism_resolved=False,
+        fusion_group_id="test-required-gpu-stage",
+        requires_complete_fusion=True,
+        required_logical_provenance=("TestGPUStage",),
         uses_terminal_output_adapter=True,
     )
+    return spec
 
 
 def _execute_gpu_stage(config, input_ranges, context, **spec_kwargs):
     input_op = InputDataBuffer(context, make_ref_bundles(input_ranges))
-    spec = _sealed_test_spec(config, context, **spec_kwargs)
+    spec = _complete_required_test_spec(config, context, **spec_kwargs)
     operator = create_gpu_operator(spec, input_op, context)
     assert isinstance(operator, ActorPoolGPUOperator)
-    assert operator.gpu_operator_spec.gate2_composed
+    assert operator.gpu_operator_spec.requires_complete_fusion
+    assert (
+        operator.gpu_operator_spec.logical_provenance
+        == operator.gpu_operator_spec.required_logical_provenance
+    )
+    assert operator.gpu_operator_spec.uses_terminal_output_adapter
     assert operator._ray_remote_args["num_gpus"] == 0
 
     return _execute_gpu_operator(operator, context)
@@ -213,7 +219,7 @@ def test_driver_registered_opaque_runtime_is_serialized_to_actor(
 ):
     context = DataContext.get_current()
     kind = "test_driver_registered_opaque_runtime"
-    spec = _sealed_test_spec(
+    spec = _complete_required_test_spec(
         _OpaqueRegisteredConfig(increment=10),
         context,
         transform_kind=kind,

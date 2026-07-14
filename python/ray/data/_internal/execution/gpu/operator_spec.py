@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Tuple, Union
 
@@ -34,8 +34,8 @@ class PayloadKind(str, Enum):
     OUTPUT_BATCH_STREAM = "output_batch_stream"
 
 
-# These are declarations, not V1 standalone adapter implementations.  Gate 2
-# elides compatible internal boundaries and the final composed stage owns egress.
+# These are declarations, not V1 standalone adapter implementations. Physical
+# fusion elides compatible internal boundaries and the composed stage owns egress.
 RANGE_WORK_ADAPTER_KEY = "ray-data-gpu-range-work-v1"
 RANGE_DATA_BOUNDARY_ADAPTER_KEY = "ray-data-gpu-range-data-boundary-v1"
 RANGE_DATA_TERMINAL_ADAPTER_KEY = "ray-data-gpu-range-data-terminal-v1"
@@ -245,8 +245,16 @@ class GPUOperatorSpec:
     input_requirements: Tuple[PropertyRequirement, ...] = ()
     output_properties: Tuple[PropertyFact, ...] = ()
     logical_provenance: Tuple[str, ...] = ()
-    gate2_composed: bool = False
-    specialized_read_parallelism_resolved: bool = False
+    # Planned operators in one required physical-fusion region carry the same
+    # group identifier and complete expected logical lineage.  These fields are
+    # declarative: only the physical optimizer may turn the region into an
+    # executable backend operator.
+    fusion_group_id: Optional[str] = None
+    requires_complete_fusion: bool = False
+    required_logical_provenance: Tuple[str, ...] = ()
+    # The composed stage owns the specialized source descriptor count, so stock
+    # Read parallelism must not reinterpret its input.
+    owns_input_parallelism: bool = False
     uses_terminal_output_adapter: bool = False
 
     def __post_init__(self) -> None:
@@ -254,6 +262,11 @@ class GPUOperatorSpec:
         object.__setattr__(self, "input_requirements", tuple(self.input_requirements))
         object.__setattr__(self, "output_properties", tuple(self.output_properties))
         object.__setattr__(self, "logical_provenance", tuple(self.logical_provenance))
+        object.__setattr__(
+            self,
+            "required_logical_provenance",
+            tuple(self.required_logical_provenance),
+        )
         if not self.spec_instance_id:
             raise ValueError("spec_instance_id must be nonempty")
         if (
@@ -281,10 +294,19 @@ class GPUOperatorSpec:
                     "adjacent transform payloads do not match: "
                     f"{upstream.transform_id} -> {downstream.transform_id}"
                 )
-        if self.specialized_read_parallelism_resolved and not self.gate2_composed:
+        if self.fusion_group_id is not None and not self.fusion_group_id:
+            raise ValueError("fusion_group_id must be nonempty when provided")
+        if self.requires_complete_fusion and not self.fusion_group_id:
             raise ValueError(
-                "specialized Read parallelism may be marked resolved only on a "
-                "gate-2-composed stage"
+                "a complete-fusion GPU spec requires a fusion_group_id"
+            )
+        if self.requires_complete_fusion and not self.required_logical_provenance:
+            raise ValueError(
+                "a complete-fusion GPU spec requires logical provenance"
+            )
+        if self.required_logical_provenance and not self.fusion_group_id:
+            raise ValueError(
+                "required logical provenance requires a fusion_group_id"
             )
 
     @property
@@ -301,23 +323,6 @@ class GPUOperatorSpec:
             self.terminal_output_adapter_key
             if self.uses_terminal_output_adapter
             else self.output_adapter_key
-        )
-
-    def for_gate2_stage(
-        self,
-        *,
-        specialized_read_parallelism_resolved: bool,
-        uses_terminal_output_adapter: bool,
-    ) -> "GPUOperatorSpec":
-        """Seal a planner-composed stage against later physical re-composition."""
-
-        return replace(
-            self,
-            gate2_composed=True,
-            specialized_read_parallelism_resolved=(
-                specialized_read_parallelism_resolved
-            ),
-            uses_terminal_output_adapter=uses_terminal_output_adapter,
         )
 
     def canonical_contract(self) -> Tuple[Any, ...]:
@@ -337,7 +342,9 @@ class GPUOperatorSpec:
             self.input_requirements,
             self.output_properties,
             self.logical_provenance,
-            self.gate2_composed,
-            self.specialized_read_parallelism_resolved,
+            self.fusion_group_id,
+            self.requires_complete_fusion,
+            self.required_logical_provenance,
+            self.owns_input_parallelism,
             self.uses_terminal_output_adapter,
         )

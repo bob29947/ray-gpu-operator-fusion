@@ -118,10 +118,11 @@ class SetReadParallelismRule(Rule):
                 continue
             if (
                 isinstance(op, GPUOperator)
-                and op.gpu_operator_spec.specialized_read_parallelism_resolved
+                and op.gpu_operator_spec.owns_input_parallelism
             ):
-                # Gate 2 owns the range count and descriptor bundles.  Stock
-                # Read splitting must not reinterpret that specialized plan.
+                # The GPU source spec owns the range count and descriptor
+                # bundles. Stock Read splitting must not reinterpret it before
+                # required physical fusion materializes the complete region.
                 ops += op.input_dependencies
                 continue
             logical_op = plan.op_map[op]

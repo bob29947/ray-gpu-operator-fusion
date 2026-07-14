@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from typing import Any, Optional
 
 _GIB = 1024**3
@@ -126,12 +127,22 @@ class CudfRuntimeContext:
         if self._region not in (None, region):
             raise RuntimeError("A GPU worker cannot change its direct-read S3 region")
         if self._aws_session is None:
-            self._aws_session, self._aws_credentials = refresh_aws_credentials(region)
-            self._s3_client = self._aws_session.create_client("s3", region_name=region)
-            configure_kvikio(region, self._aws_session, self._aws_credentials)
-            self.cudf.set_option("kvikio_remote_io", True)
-            if not self.cudf.get_option("kvikio_remote_io"):
-                raise RuntimeError("cuDF rejected KvikIO remote I/O")
+            client = None
+            try:
+                session, credentials = refresh_aws_credentials(region)
+                client = session.create_client("s3", region_name=region)
+                configure_kvikio(region, session, credentials)
+                self.cudf.set_option("kvikio_remote_io", True)
+                if not self.cudf.get_option("kvikio_remote_io"):
+                    raise RuntimeError("cuDF rejected KvikIO remote I/O")
+            except Exception:
+                if client is not None:
+                    with suppress(Exception):
+                        client.close()
+                raise
+            self._aws_session = session
+            self._aws_credentials = credentials
+            self._s3_client = client
         self._source_kind = "s3"
         self._region = region
 
@@ -144,8 +155,13 @@ class CudfRuntimeContext:
     def refresh_s3_for_task(self) -> None:
         if self._source_kind != "s3":
             return
-        refresh_aws_credentials(self._region, self._aws_session, self._aws_credentials)
-        self._s3_client.close()
-        self._s3_client = self._aws_session.create_client(
-            "s3", region_name=self._region
+        session, credentials = refresh_aws_credentials(
+            self._region, self._aws_session, self._aws_credentials
         )
+        client = session.create_client("s3", region_name=self._region)
+        previous_client = self._s3_client
+        self._aws_session = session
+        self._aws_credentials = credentials
+        self._s3_client = client
+        with suppress(Exception):
+            previous_client.close()

@@ -199,7 +199,7 @@ class Planner:
     def __init__(self):
         self._supports_checkpointing = False
         self._plan_fns_for_checkpointing = {}
-        self._gpu_gate2_planner = None
+        self._gpu_required_fusion_planner = None
 
     def plan(
         self, logical_plan: LogicalPlan
@@ -208,13 +208,13 @@ class Planner:
         checkpoint_config = logical_plan.context.checkpoint_config
         # Planner instances can be reused. GPU analysis is immutable and
         # plan-local; it runs after logical optimization and before lowering.
-        self._gpu_gate2_planner = None
+        self._gpu_required_fusion_planner = None
         if logical_plan.context.enable_gpu_operator_fusion:
             from ray.data._internal.planner.gpu_plan_provider import (
-                create_gpu_gate2_planner,
+                create_gpu_required_fusion_planner,
             )
 
-            self._gpu_gate2_planner = create_gpu_gate2_planner(
+            self._gpu_required_fusion_planner = create_gpu_required_fusion_planner(
                 logical_plan.dag, logical_plan.context
             )
 
@@ -279,19 +279,21 @@ class Planner:
             A tuple of the physical operator corresponding to the logical operator, and
             a mapping from physical to logical operators.
         """
-        # Gate 2 must claim a maximal component before stock children are
-        # recursively built, otherwise its consumed subtree would be discarded.
-        if self._gpu_gate2_planner is not None:
-            planned = self._gpu_gate2_planner.try_plan(logical_op, data_context)
+        # Required GPU planning must claim its exact component before stock
+        # children are built, otherwise its consumed subtree would be discarded.
+        if self._gpu_required_fusion_planner is not None:
+            planned = self._gpu_required_fusion_planner.try_plan(
+                logical_op, data_context
+            )
             if planned is not None:
                 return planned.root, dict(planned.op_map)
 
         if type(logical_op) is MapGroupPartitions:
             from ray.data._internal.planner.gpu_plan_provider import (
-                raise_mgp_without_gpu_gate2,
+                raise_mgp_without_required_gpu_fusion,
             )
 
-            raise_mgp_without_gpu_gate2(
+            raise_mgp_without_required_gpu_fusion(
                 logical_op,
                 gpu_enabled=data_context.enable_gpu_operator_fusion,
             )

@@ -1,10 +1,9 @@
-"""Exact-type logical lowerer registry used by the gate-2 GPU planner."""
+"""Immutable inputs and results shared by the three V1 GPU lowerers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, Protocol
+from typing import Optional
 
 from ray.data._internal.execution.gpu.operator import GPUOperatorCreationOptions
 from ray.data._internal.execution.gpu.operator_spec import (
@@ -12,20 +11,10 @@ from ray.data._internal.execution.gpu.operator_spec import (
     GPUOperatorSpec,
 )
 from ray.data._internal.execution.gpu.properties import PropertyFact
-from ray.data._internal.logical.interfaces import LogicalOperator
 from ray.data._internal.planner.gpu_read_source_provider import (
     GPUReadSourceArtifacts,
     GPUReadSourceProvider,
 )
-
-if TYPE_CHECKING:
-    from ray.data.context import DataContext
-
-
-class GPUComponentRole(str, Enum):
-    SOURCE = "source"
-    UNARY = "unary"
-    PARTITION_CONSUMER = "partition_consumer"
 
 
 @dataclass(frozen=True)
@@ -150,89 +139,3 @@ class GPULoweredOperator:
             raise ValueError(
                 "lowered source artifacts and downstream context must match"
             )
-
-
-class GPULogicalLowerer(Protocol):
-    component_role: GPUComponentRole
-
-    def analyze(
-        self, logical_op: LogicalOperator, data_context: "DataContext"
-    ) -> GPULogicalAnalysis: ...
-
-    def lower(
-        self, logical_op: LogicalOperator, context: GPULoweringContext
-    ) -> GPULoweredOperator: ...
-
-
-class GPULogicalLowererRegistry:
-    """Exact-class registry used by one plan-local gate-2 analysis."""
-
-    def __init__(self) -> None:
-        self._lowerers: Dict[type[LogicalOperator], GPULogicalLowerer] = {}
-
-    def register(
-        self,
-        logical_type: type[LogicalOperator],
-        lowerer: GPULogicalLowerer,
-    ) -> None:
-        if logical_type in self._lowerers:
-            raise ValueError(
-                f"GPU lowerer already registered for {logical_type.__name__}"
-            )
-        self._lowerers[logical_type] = lowerer
-
-    def unregister(
-        self,
-        logical_type: type[LogicalOperator],
-        *,
-        expected: Optional[GPULogicalLowerer] = None,
-    ) -> GPULogicalLowerer:
-        """Remove one lowerer, optionally guarding against stale cleanup."""
-
-        try:
-            lowerer = self._lowerers[logical_type]
-        except KeyError as exc:
-            raise KeyError(
-                f"No GPU lowerer is registered for {logical_type.__name__}"
-            ) from exc
-        if expected is not None and lowerer is not expected:
-            raise ValueError(
-                f"GPU lowerer for {logical_type.__name__} is not the expected "
-                "instance"
-            )
-        del self._lowerers[logical_type]
-        return lowerer
-
-    def copy(self) -> "GPULogicalLowererRegistry":
-        """Return a plan-local snapshot of the registered lowerers."""
-
-        registry = GPULogicalLowererRegistry()
-        registry._lowerers.update(self._lowerers)
-        return registry
-
-    def get(self, logical_op: LogicalOperator) -> Optional[GPULogicalLowerer]:
-        return self._lowerers.get(type(logical_op))
-
-    def role_for(self, logical_op: LogicalOperator) -> Optional[GPUComponentRole]:
-        lowerer = self.get(logical_op)
-        return None if lowerer is None else lowerer.component_role
-
-    def analyze(
-        self, logical_op: LogicalOperator, data_context: "DataContext"
-    ) -> GPULogicalAnalysis:
-        lowerer = self.get(logical_op)
-        if lowerer is None:
-            raise ValueError(
-                f"No GPU lowerer for exact logical type {type(logical_op).__name__}"
-            )
-        return lowerer.analyze(logical_op, data_context)
-
-    def lower(
-        self, logical_op: LogicalOperator, context: GPULoweringContext
-    ) -> GPULoweredOperator:
-        lowerer = self.get(logical_op)
-        if lowerer is None:
-            raise ValueError(
-                f"No GPU lowerer for exact logical type {type(logical_op).__name__}"
-            )
-        return lowerer.lower(logical_op, context)

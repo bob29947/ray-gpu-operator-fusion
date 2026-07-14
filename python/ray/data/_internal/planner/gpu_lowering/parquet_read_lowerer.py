@@ -2,7 +2,6 @@
 
 from ray.data._internal.logical.operators import Read
 from ray.data._internal.planner.gpu_lowering.interfaces import (
-    GPUComponentRole,
     GPULogicalAnalysis,
     GPULoweredOperator,
     GPULoweringContext,
@@ -13,14 +12,11 @@ from ray.data._internal.planner.gpu_read_source_provider import (
 
 
 class GPUReadLowerer:
-    component_role = GPUComponentRole.SOURCE
-
     def analyze(self, logical_op: Read, data_context) -> GPULogicalAnalysis:
         del data_context
         if type(logical_op) is not Read:
             return GPULogicalAnalysis(False, "logical_read")
-        # Source capability is selected through GPUReadSourceProviderRegistry.
-        # Full recognition and concrete source work remain inside lower().
+        # Full source recognition and concrete range work remain inside lower().
         return GPULogicalAnalysis(True, None)
 
     def lower(

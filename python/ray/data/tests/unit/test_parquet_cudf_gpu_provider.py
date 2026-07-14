@@ -1,5 +1,4 @@
 import copy
-from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -8,86 +7,57 @@ import pyarrow.parquet as pq
 import pytest
 
 import ray.data
+import ray.data._internal.execution.gpu as gpu_package
 from ray.data import ActorPoolStrategy, UDFProperties
 from ray.data._internal.datasource import parquet_datasource
 from ray.data._internal.execution.gpu import (
-    CompletePartitionBundles,
-    Evidence,
     GPUCompositionError,
     GPUCompositionErrorReason,
     GPUOperator,
-    GPUOperatorCreationOptions,
-    GPUOperatorSpec,
-    GPUTransformSpec,
-    PropertyFact,
-    RangePartitioning,
-    GPUBoundaryAdapter,
+    GPURequiredFusionError,
     GPUBoundaryDirection,
     PayloadKind,
+    PlannedGPUOperator,
     RANGE_DATA_BOUNDARY_ADAPTER_KEY,
     RANGE_DATA_TERMINAL_ADAPTER_KEY,
     RANGE_WORK_ADAPTER_KEY,
     RowsOwnedByRange,
     get_gpu_boundary_adapter,
     register_gpu_boundary_adapter,
-    register_gpu_transform_runtime,
     unregister_gpu_boundary_adapter,
-    unregister_gpu_transform_runtime,
 )
+from ray.data._internal.execution.gpu import operator as gpu_operator_module
+from ray.data._internal.execution.gpu import region_compiler
+from ray.data._internal.execution.operators import hash_shuffle
 from ray.data._internal.execution.operators.actor_pool_gpu_operator import (
     ActorPoolGPUOperator,
 )
-from ray.data._internal.execution.operators import hash_shuffle
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
-from ray.data._internal.logical.interfaces import LogicalPlan
-from ray.data._internal.logical.operators import MapBatches, MapGroupPartitions, Read
+from ray.data._internal.logical.operators import MapBatches, Read
 from ray.data._internal.logical.optimizers import PhysicalOptimizer
 from ray.data._internal.logical.rules import FuseGPUOperators
+from ray.data._internal.logical.rules import gpu_operator_fusion
 from ray.data._internal.logical.rules.set_read_parallelism import (
     SetReadParallelismRule,
-)
-from ray.data._internal.planner.gpu_plan_provider import create_gpu_gate2_planner
-from ray.data._internal.planner.gpu_planning_errors import (
-    GPUPlanningError,
-    GPUPlanningErrorReason,
-)
-from ray.data._internal.planner.gpu_read_source_provider import (
-    GPUReadSourceArtifacts,
-    GPUReadSourceLowering,
-    GPUReadSourceSupport,
-)
-from ray.data._internal.planner.gpu_registrations import (
-    register_gpu_logical_lowerer,
-    register_gpu_property_enforcer,
-    register_gpu_property_transfer,
-    register_gpu_read_source_provider,
-    unregister_gpu_logical_lowerer,
-    unregister_gpu_property_enforcer,
-    unregister_gpu_property_transfer,
-    unregister_gpu_read_source_provider,
-)
-from ray.data._internal.planner.gpu_requirement_analysis import (
-    GPUEnforcerPlan,
-    GPUEnforcerRegistry,
-    GPUPropertyState,
-)
-from ray.data._internal.planner.gpu_lowering.map_batches_lowerer import (
-    GPUMapBatchesLowerer,
 )
 from ray.data._internal.planner.gpu_lowering.map_group_partitions_lowerer import (
     GPUMapGroupPartitionsLowerer,
 )
+from ray.data._internal.planner.gpu_plan_provider import (
+    create_gpu_required_fusion_planner,
+)
+from ray.data._internal.planner.gpu_planning_errors import (
+    GPUPlanningError,
+    GPUPlanningErrorReason,
+)
+from ray.data._internal.planner.parquet_cudf_range_planner import (
+    ParquetCudfPlanningError,
+)
 from ray.data._internal.planner.planner import Planner
 from ray.data.context import DataContext
-from ray.data.datasource.datasource import Datasource
 
 
 class _Tokenizer:
-    def __call__(self, batch):
-        return batch
-
-
-class _Tokenizer2:
     def __call__(self, batch):
         return batch
 
@@ -130,6 +100,9 @@ def fusion_context(monkeypatch):
     context.use_datasource_v2 = False
     context.enable_gpu_operator_fusion = True
     context.checkpoint_config = None
+    context.actor_task_retry_on_errors = False
+    context.actor_init_retry_on_errors = False
+    context.retried_map_errors = False
     yield context
     DataContext._set_current(original)
 
@@ -156,22 +129,15 @@ def _read(path, *, ray_remote_args=None):
     )
 
 
-def _map(
-    dataset,
-    *,
-    fn=_Tokenizer,
-    size=1,
-    preserves=True,
-    scheduling_strategy=None,
-):
+def _map(dataset, *, preserves=True, scheduling_strategy=None):
     remote_args = {"num_cpus": 1, "num_gpus": 1}
     if scheduling_strategy is not None:
         remote_args["scheduling_strategy"] = scheduling_strategy
     return dataset.map_batches(
-        fn,
+        _Tokenizer,
         batch_size=2,
         batch_format="cudf",
-        compute=ActorPoolStrategy(size=size),
+        compute=ActorPoolStrategy(size=1),
         udf_properties=(
             UDFProperties(preserves_partitioning=True) if preserves else None
         ),
@@ -179,18 +145,9 @@ def _map(
     )
 
 
-def _mgp(
-    dataset,
-    *,
-    keys=("User", "Card"),
-    count=2,
-    preserves=False,
-):
+def _mgp(dataset, *, keys=("User", "Card"), count=2):
     return dataset.groupby(list(keys), num_partitions=count).map_group_partitions(
-        _partition_fn,
-        udf_properties=(
-            UDFProperties(preserves_partitioning=True) if preserves else None
-        ),
+        _partition_fn
     )
 
 
@@ -202,11 +159,25 @@ def _gpu_ops(plan):
     return [op for op in plan.dag.post_order_iter() if isinstance(op, GPUOperator)]
 
 
+def _planned_ops(plan):
+    return [
+        op for op in plan.dag.post_order_iter() if isinstance(op, PlannedGPUOperator)
+    ]
+
+
+def _actor_ops(plan):
+    return [
+        op
+        for op in plan.dag.post_order_iter()
+        if isinstance(op, ActorPoolGPUOperator)
+    ]
+
+
 def _kinds(gpu_op):
     return tuple(transform.kind for transform in gpu_op.gpu_operator_spec.transforms)
 
 
-def test_gate2_emits_one_executable_stage_before_physical_fusion(
+def test_planner_emits_three_deferred_specs_then_physical_optimizer_fuses(
     tmp_path, fusion_context
 ):
     dataset = _pipeline(_write_parquet(tmp_path))
@@ -216,10 +187,75 @@ def test_gate2_emits_one_executable_stage_before_physical_fusion(
 
     plan, _ = Planner().plan(dataset._logical_plan)
 
-    assert len(_gpu_ops(plan)) == 1
-    stage = _gpu_ops(plan)[0]
-    assert isinstance(stage.input_dependencies[0], InputDataBuffer)
-    assert _kinds(stage) == (
+    operators = list(plan.dag.post_order_iter())
+    planned = _planned_ops(plan)
+    assert len(planned) == 3
+    assert _actor_ops(plan) == []
+    assert isinstance(operators[0], InputDataBuffer)
+    assert [_kinds(op) for op in planned] == [
+        ("read_parquet_range",),
+        ("map_batches", "validate_range_ownership"),
+        ("sort_partition", "build_group_boundaries", "map_group_partitions"),
+    ]
+    assert planned[0].input_dependencies == [operators[0]]
+    assert planned[1].input_dependencies == [planned[0]]
+    assert planned[2].input_dependencies == [planned[1]]
+
+    specs = [op.gpu_operator_spec for op in planned]
+    assert len({spec.fusion_group_id for spec in specs}) == 1
+    required_provenance = specs[0].required_logical_provenance
+    assert tuple(
+        logical_id for spec in specs for logical_id in spec.logical_provenance
+    ) == required_provenance
+    assert all(
+        spec.required_logical_provenance == required_provenance for spec in specs
+    )
+    assert all(spec.requires_complete_fusion for spec in specs)
+    assert [spec.owns_input_parallelism for spec in specs] == [True, False, False]
+    assert [spec.uses_terminal_output_adapter for spec in specs] == [False, False, True]
+    assert [spec.native_input_payload for spec in specs] == [
+        PayloadKind.RANGE_WORK,
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+    ]
+    assert [spec.native_output_payload for spec in specs] == [
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+    ]
+    assert [spec.input_adapter_key for spec in specs] == [
+        RANGE_WORK_ADAPTER_KEY,
+        RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+        RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    ]
+    assert [spec.active_output_adapter_key for spec in specs] == [
+        RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+        RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+        RANGE_DATA_TERMINAL_ADAPTER_KEY,
+    ]
+    transform_ids = tuple(
+        transform_id for spec in specs for transform_id in spec.transform_ids
+    )
+    assert len(transform_ids) == len(set(transform_ids))
+
+    assert set(plan.op_map) == set(operators)
+    assert plan.op_map[operators[0]] is read
+    assert plan.op_map[planned[0]] is read
+    assert plan.op_map[planned[1]] is mapped
+    assert plan.op_map[planned[2]] is grouped
+    assert operators[0]._logical_operators == [read]
+    assert planned[0]._logical_operators == [read]
+    assert planned[1]._logical_operators == [mapped]
+    assert planned[2]._logical_operators == [grouped]
+
+    optimized = PhysicalOptimizer().optimize(plan)
+
+    assert _planned_ops(optimized) == []
+    actors = _actor_ops(optimized)
+    assert len(actors) == 1
+    actor = actors[0]
+    assert _gpu_ops(optimized) == [actor]
+    assert _kinds(actor) == (
         "read_parquet_range",
         "map_batches",
         "validate_range_ownership",
@@ -227,23 +263,52 @@ def test_gate2_emits_one_executable_stage_before_physical_fusion(
         "build_group_boundaries",
         "map_group_partitions",
     )
-    assert stage.gpu_operator_spec.gate2_composed
-    assert stage.gpu_operator_spec.specialized_read_parallelism_resolved
-    assert stage.gpu_creation_options.min_rows_per_bundle == 1
-    assert stage._min_rows_per_bundle == 1
-    assert stage._logical_operators == [read, mapped, grouped]
-    assert plan.op_map[stage.input_dependencies[0]] is read
-    assert plan.op_map[stage] is grouped
-    assert len(stage.gpu_operator_spec.transform_ids) == len(
-        set(stage.gpu_operator_spec.transform_ids)
-    )
-    assert not any(
-        "boundary" in kind or kind in ("import", "export") for kind in _kinds(stage)
-    )
+    assert isinstance(actor.input_dependencies[0], InputDataBuffer)
+    assert actor.gpu_operator_spec.logical_provenance == required_provenance
+    assert actor.gpu_operator_spec.required_logical_provenance == required_provenance
+    assert actor.gpu_operator_spec.requires_complete_fusion
+    assert actor.gpu_operator_spec.owns_input_parallelism
+    assert actor.gpu_operator_spec.uses_terminal_output_adapter
+    assert actor.gpu_creation_options.min_rows_per_bundle == 1
+    assert actor._logical_operators == [read, mapped, grouped]
+    final_operators = list(optimized.dag.post_order_iter())
+    assert set(optimized.op_map) == set(final_operators)
+    assert optimized.op_map[actor.input_dependencies[0]] is read
+    assert optimized.op_map[actor] is grouped
+
+
+def test_only_physical_optimizer_composes_and_constructs_backend(
+    tmp_path, fusion_context, monkeypatch
+):
+    compile_calls = []
+    factory_calls = []
+    original_compile = region_compiler.compile_gpu_region
+    original_factory = gpu_operator_module.create_gpu_operator
+
+    def compile_spy(*args, **kwargs):
+        compile_calls.append((args, kwargs))
+        return original_compile(*args, **kwargs)
+
+    def factory_spy(*args, **kwargs):
+        factory_calls.append((args, kwargs))
+        return original_factory(*args, **kwargs)
+
+    for module in (gpu_package, region_compiler, gpu_operator_fusion):
+        monkeypatch.setattr(module, "compile_gpu_region", compile_spy)
+    for module in (gpu_package, gpu_operator_module, gpu_operator_fusion):
+        monkeypatch.setattr(module, "create_gpu_operator", factory_spy)
+
+    plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
+
+    assert len(_planned_ops(plan)) == 3
+    assert compile_calls == []
+    assert factory_calls == []
 
     optimized = PhysicalOptimizer().optimize(plan)
-    assert len(_gpu_ops(optimized)) == 1
-    assert _gpu_ops(optimized)[0].gpu_operator_spec.gate2_composed
+
+    assert len(_actor_ops(optimized)) == 1
+    assert len(compile_calls) == 1
+    assert len(factory_calls) == 1
 
 
 class _PhysicalOptimizerWithoutGPUFusion(PhysicalOptimizer):
@@ -254,50 +319,67 @@ class _PhysicalOptimizerWithoutGPUFusion(PhysicalOptimizer):
         ]
 
 
-def test_gate2_stage_is_executable_without_physical_gpu_fusion(
+def test_missing_physical_fuser_is_fatal(tmp_path, fusion_context):
+    plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
+
+    with pytest.raises(GPURequiredFusionError) as captured:
+        _PhysicalOptimizerWithoutGPUFusion().optimize(plan)
+
+    assert "planned gpu" in str(captured.value).lower()
+
+
+def test_deferred_spec_identity_is_stable_across_replanning(
     tmp_path, fusion_context
 ):
-    dataset = _mgp(_read(_write_parquet(tmp_path)))
-    plan, _ = Planner().plan(dataset._logical_plan)
-
-    optimized = _PhysicalOptimizerWithoutGPUFusion().optimize(plan)
-
-    assert len(_gpu_ops(optimized)) == 1
-    stage = _gpu_ops(optimized)[0]
-    assert isinstance(stage, ActorPoolGPUOperator)
-    assert stage.gpu_operator_spec.gate2_composed
-    assert not stage.supports_fusion()
-
-
-def test_gate2_identity_is_stable_across_replanning(tmp_path, fusion_context):
     dataset = _pipeline(_write_parquet(tmp_path))
 
     first, _ = Planner().plan(dataset._logical_plan)
     second, _ = Planner().plan(dataset._logical_plan)
-    first_spec = _gpu_ops(first)[0].gpu_operator_spec
-    second_spec = _gpu_ops(second)[0].gpu_operator_spec
+    first_specs = [op.gpu_operator_spec for op in _planned_ops(first)]
+    second_specs = [op.gpu_operator_spec for op in _planned_ops(second)]
 
-    assert first_spec.transform_ids == second_spec.transform_ids
-    assert first_spec.spec_instance_id == second_spec.spec_instance_id
+    assert [spec.spec_instance_id for spec in first_specs] == [
+        spec.spec_instance_id for spec in second_specs
+    ]
+    assert [spec.transform_ids for spec in first_specs] == [
+        spec.transform_ids for spec in second_specs
+    ]
+    assert [spec.fusion_group_id for spec in first_specs] == [
+        spec.fusion_group_id for spec in second_specs
+    ]
+    assert [spec.required_logical_provenance for spec in first_specs] == [
+        spec.required_logical_provenance for spec in second_specs
+    ]
 
 
-def test_stock_read_parallelism_rule_skips_specialized_stage(tmp_path, fusion_context):
+def test_stock_read_parallelism_rule_skips_planned_gpu_source(
+    tmp_path, fusion_context, monkeypatch
+):
     plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
-    stage = _gpu_ops(plan)[0]
-    stage_input = stage.input_dependencies[0]
+    planned = _planned_ops(plan)
+    source = planned[0]
+    source_input = source.input_dependencies[0]
 
+    def fail_if_stock_read_is_reinterpreted(*args, **kwargs):
+        raise AssertionError("stock Read parallelism touched GPU range work")
+
+    monkeypatch.setattr(
+        SetReadParallelismRule,
+        "_apply",
+        fail_if_stock_read_is_reinterpreted,
+    )
     result = SetReadParallelismRule().apply(plan)
 
     assert result is plan
-    assert result.dag is stage
-    assert stage.input_dependencies[0] is stage_input
+    assert _planned_ops(result) == planned
+    assert source.input_dependencies == [source_input]
 
 
-def test_gate2_claims_before_stock_child_planning(
+def test_planner_claims_before_stock_child_planning(
     tmp_path, fusion_context, monkeypatch
 ):
     def fail_if_stock_child_is_planned(*args, **kwargs):
-        raise AssertionError("gate 2 built and discarded a stock child")
+        raise AssertionError("GPU planner built and discarded a stock child")
 
     monkeypatch.setitem(Planner._DEFAULT_PLAN_FNS, Read, fail_if_stock_child_is_planned)
     monkeypatch.setitem(
@@ -305,498 +387,30 @@ def test_gate2_claims_before_stock_child_planning(
     )
 
     plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
-    assert len(_gpu_ops(plan)) == 1
+
+    assert len(_planned_ops(plan)) == 3
 
 
-class _RegisteredSource(Datasource):
-    pass
-
-
-class _RegisteredSourceProvider:
-    provider_name = "test_registered_non_parquet"
-
-    def __init__(
-        self,
-        *,
-        transform_kind="registered_source",
-        transform_config=None,
-    ):
-        self.support_calls = 0
-        self.lower_calls = 0
-        self.transform_kind = transform_kind
-        self.transform_config = (
-            (lambda value, _context: value)
-            if transform_config is None
-            else transform_config
-        )
-
-    def supports(self, logical_op, demand):
-        del demand
-        self.support_calls += 1
-        accepted = (
-            type(logical_op) is Read
-            and type(logical_op.datasource) is _RegisteredSource
-        )
-        return GPUReadSourceSupport(
-            accepted,
-            "not_registered_test_source" if not accepted else "",
-        )
-
-    def lower(self, logical_op, request):
-        assert type(logical_op.datasource) is _RegisteredSource
-        self.lower_calls += 1
-        range_properties = (
-            PropertyFact(
-                RangePartitioning((request.group_keys[0],), "registered-source"),
-                Evidence.OPERATOR_GUARANTEE,
-            ),
-            PropertyFact(
-                CompletePartitionBundles(),
-                Evidence.OPERATOR_GUARANTEE,
-            ),
-        )
-        return GPUReadSourceLowering(
-            spec=GPUOperatorSpec(
-                spec_instance_id=request.logical_node_id,
-                transforms=(
-                    GPUTransformSpec(
-                        transform_id=request.transform_id(0, self.transform_kind),
-                        kind=self.transform_kind,
-                        input_payload=PayloadKind.RANGE_WORK,
-                        output_payload=PayloadKind.RANGE_DATA,
-                        config=self.transform_config,
-                    ),
-                ),
-                external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
-                external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
-                native_input_payload=PayloadKind.RANGE_WORK,
-                native_output_payload=PayloadKind.RANGE_DATA,
-                input_adapter_key=RANGE_WORK_ADAPTER_KEY,
-                output_adapter_key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
-                terminal_output_adapter_key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
-                execution_requirements=request.execution_requirements,
-                output_properties=range_properties,
-                logical_provenance=(request.logical_node_id,),
-            ),
-            creation_options=GPUOperatorCreationOptions(
-                name="RegisteredGPUSource",
-                min_rows_per_bundle=1,
-                target_max_block_size_override=request.target_max_block_size,
-            ),
-            artifacts=GPUReadSourceArtifacts(
-                input_data_factory=lambda _target_size: [],
-                provider_artifacts="registered-source-artifacts",
-            ),
-        )
-
-
-def test_globally_registered_non_parquet_source_is_used_by_planner(fusion_context):
-    source = _RegisteredSource()
-    read = Read(
-        datasource=source,
-        datasource_or_legacy_reader=source,
-        parallelism=1,
-    )
-    mapped = MapBatches(
-        fn=_Tokenizer,
-        input_dependencies=[read],
-        batch_size=2,
-        batch_format="cudf",
-        compute=ActorPoolStrategy(size=1),
-        ray_remote_args={"num_cpus": 1, "num_gpus": 1},
-        udf_properties=UDFProperties(preserves_partitioning=True),
-    )
-    grouped = MapGroupPartitions(
-        key=["User", "Card"],
-        num_partitions=2,
-        fn=_partition_fn,
-        input_dependencies=[mapped],
-    )
-    provider = _RegisteredSourceProvider()
-    register_gpu_read_source_provider(provider)
-    try:
-        plan, _ = Planner().plan(LogicalPlan(grouped, fusion_context))
-    finally:
-        unregister_gpu_read_source_provider(
-            provider.provider_name,
-            expected=provider,
-        )
-
-    assert provider.support_calls == 1
-    assert provider.lower_calls == 1
-    assert len(_gpu_ops(plan)) == 1
-    assert _kinds(_gpu_ops(plan)[0])[0] == "registered_source"
-
-
-def _registered_source_component(fusion_context):
-    source = _RegisteredSource()
-    read = Read(
-        datasource=source,
-        datasource_or_legacy_reader=source,
-        parallelism=1,
-    )
-    mapped = MapBatches(
-        fn=_Tokenizer,
-        input_dependencies=[read],
-        batch_size=2,
-        batch_format="cudf",
-        compute=ActorPoolStrategy(size=1),
-        ray_remote_args={"num_cpus": 1, "num_gpus": 1},
-        udf_properties=UDFProperties(preserves_partitioning=True),
-    )
-    return MapGroupPartitions(
-        key=["User", "Card"],
-        num_partitions=2,
-        fn=_partition_fn,
-        input_dependencies=[mapped],
-    ), fusion_context
-
-
-def test_unknown_transform_runtime_is_rejected_by_planner(fusion_context):
-    provider = _RegisteredSourceProvider(
-        transform_kind="test_unknown_runtime",
-        transform_config=object(),
-    )
-    component, context = _registered_source_component(fusion_context)
-    register_gpu_read_source_provider(provider)
-    try:
-        with pytest.raises(GPUPlanningError) as captured:
-            Planner().plan(LogicalPlan(component, context))
-    finally:
-        unregister_gpu_read_source_provider(
-            provider.provider_name,
-            expected=provider,
-        )
-
-    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
-    assert "factory or boundary adapter refused" in str(captured.value)
-
-
-def test_registered_transform_runtime_is_additive_at_planning(fusion_context):
-    kind = "test_registered_runtime"
-    provider = _RegisteredSourceProvider(
-        transform_kind=kind,
-        transform_config=object(),
-    )
-    component, context = _registered_source_component(fusion_context)
-    constructed = []
-
-    def factory(transform_spec, runtime_context):
-        constructed.append((transform_spec, runtime_context))
-        raise AssertionError("planning must not construct a transform runtime")
-
-    register_gpu_transform_runtime(kind, factory)
-    register_gpu_read_source_provider(provider)
-    try:
-        plan, _ = Planner().plan(LogicalPlan(component, context))
-    finally:
-        unregister_gpu_read_source_provider(
-            provider.provider_name,
-            expected=provider,
-        )
-        unregister_gpu_transform_runtime(kind, expected=factory)
-
-    assert len(_gpu_ops(plan)) == 1
-    assert constructed == []
-
-
-class _RegisteredUnary(MapBatches):
-    pass
-
-
-def _as_builtin_map_batches(logical_op):
-    return MapBatches(
-        fn=logical_op.fn,
-        input_dependencies=logical_op.input_dependencies,
-        can_modify_num_rows=logical_op.can_modify_num_rows,
-        udf_properties=logical_op.udf_properties,
-        batch_size=logical_op.batch_size,
-        batch_format=logical_op.batch_format,
-        zero_copy_batch=logical_op.zero_copy_batch,
-        fn_args=logical_op.fn_args,
-        fn_kwargs=logical_op.fn_kwargs,
-        fn_constructor_args=logical_op.fn_constructor_args,
-        fn_constructor_kwargs=logical_op.fn_constructor_kwargs,
-        min_rows_per_bundled_input=logical_op.min_rows_per_bundled_input,
-        compute=logical_op.compute,
-        ray_remote_args_fn=logical_op.ray_remote_args_fn,
-        ray_remote_args=logical_op.ray_remote_args,
-        per_block_limit=logical_op.per_block_limit,
-    )
-
-
-class _RegisteredUnaryLowerer:
-    component_role = GPUMapBatchesLowerer.component_role
-
-    def __init__(self):
-        self._delegate = GPUMapBatchesLowerer()
-        self.lower_calls = 0
-
-    def analyze(self, logical_op, data_context):
-        return self._delegate.analyze(_as_builtin_map_batches(logical_op), data_context)
-
-    def lower(self, logical_op, context):
-        self.lower_calls += 1
-        return self._delegate.lower(_as_builtin_map_batches(logical_op), context)
-
-
-class _IncompleteRegisteredUnaryLowerer(_RegisteredUnaryLowerer):
-    def lower(self, logical_op, context):
-        lowered = super().lower(logical_op, context)
-        incomplete_facts = lowered.spec.output_properties[:1]
-        return replace(
-            lowered,
-            spec=replace(
-                lowered.spec,
-                output_properties=incomplete_facts,
-            ),
-            downstream_context=replace(
-                lowered.downstream_context,
-                input_properties=incomplete_facts,
-            ),
-        )
-
-
-class _PreservingRegisteredUnaryTransfer:
-    def transfer(self, logical_op, input_state):
-        assert type(logical_op) is _RegisteredUnary
-        return input_state
-
-
-class _ConcreteFailingRegisteredUnaryTransfer:
-    def transfer(self, logical_op, input_state):
-        assert type(logical_op) is _RegisteredUnary
-        range_fact = next(
-            fact
-            for fact in input_state.facts
-            if isinstance(fact.value, RangePartitioning)
-        )
-        if range_fact.value.scheme_id.startswith("analysis:"):
-            return input_state
-        raise RuntimeError("test concrete property transfer failure")
-
-
-def test_globally_registered_unary_and_transfer_are_used_by_planner(
-    tmp_path, fusion_context
-):
-    read = _read(_write_parquet(tmp_path))._logical_plan.dag
-    unary = _RegisteredUnary(
-        fn=_Tokenizer,
-        input_dependencies=[read],
-        batch_size=2,
-        batch_format="cudf",
-        compute=ActorPoolStrategy(size=1),
-        ray_remote_args={"num_cpus": 1, "num_gpus": 1},
-        udf_properties=UDFProperties(preserves_partitioning=True),
-    )
-    grouped = MapGroupPartitions(
-        key=["User", "Card"],
-        num_partitions=2,
-        fn=_partition_fn,
-        input_dependencies=[unary],
-    )
-    lowerer = _RegisteredUnaryLowerer()
-    transfer = _PreservingRegisteredUnaryTransfer()
-    register_gpu_logical_lowerer(_RegisteredUnary, lowerer)
-    try:
-        register_gpu_property_transfer(_RegisteredUnary, transfer)
-        try:
-            plan, _ = Planner().plan(LogicalPlan(grouped, fusion_context))
-        finally:
-            unregister_gpu_property_transfer(_RegisteredUnary, expected=transfer)
-    finally:
-        unregister_gpu_logical_lowerer(_RegisteredUnary, expected=lowerer)
-
-    assert lowerer.lower_calls == 1
-    assert len(_gpu_ops(plan)) == 1
-    assert "map_batches" in _kinds(_gpu_ops(plan)[0])
-
-
-def test_registered_unary_lowerer_must_match_concrete_property_transfer(
-    tmp_path, fusion_context
-):
-    read = _read(_write_parquet(tmp_path))._logical_plan.dag
-    unary = _RegisteredUnary(
-        fn=_Tokenizer,
-        input_dependencies=[read],
-        batch_size=2,
-        batch_format="cudf",
-        compute=ActorPoolStrategy(size=1),
-        ray_remote_args={"num_cpus": 1, "num_gpus": 1},
-        udf_properties=UDFProperties(preserves_partitioning=True),
-    )
-    grouped = MapGroupPartitions(
-        key=["User", "Card"],
-        num_partitions=2,
-        fn=_partition_fn,
-        input_dependencies=[unary],
-    )
-    lowerer = _IncompleteRegisteredUnaryLowerer()
-    transfer = _PreservingRegisteredUnaryTransfer()
-    register_gpu_logical_lowerer(_RegisteredUnary, lowerer)
-    try:
-        register_gpu_property_transfer(_RegisteredUnary, transfer)
-        try:
-            with pytest.raises(GPUPlanningError) as captured:
-                Planner().plan(LogicalPlan(grouped, fusion_context))
-        finally:
-            unregister_gpu_property_transfer(_RegisteredUnary, expected=transfer)
-    finally:
-        unregister_gpu_logical_lowerer(_RegisteredUnary, expected=lowerer)
-
-    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
-    assert "GPU lowerer and registered property transfer disagree" in str(
-        captured.value
-    )
-    assert "expected_output_facts=" in str(captured.value)
-    assert "actual_output_facts=" in str(captured.value)
-    assert "CompletePartitionBundles" in str(captured.value)
-
-
-def test_concrete_property_transfer_failure_is_chained_planning_error(
-    tmp_path, fusion_context
-):
-    read = _read(_write_parquet(tmp_path))._logical_plan.dag
-    unary = _RegisteredUnary(
-        fn=_Tokenizer,
-        input_dependencies=[read],
-        batch_size=2,
-        batch_format="cudf",
-        compute=ActorPoolStrategy(size=1),
-        ray_remote_args={"num_cpus": 1, "num_gpus": 1},
-        udf_properties=UDFProperties(preserves_partitioning=True),
-    )
-    grouped = MapGroupPartitions(
-        key=["User", "Card"],
-        num_partitions=2,
-        fn=_partition_fn,
-        input_dependencies=[unary],
-    )
-    lowerer = _RegisteredUnaryLowerer()
-    transfer = _ConcreteFailingRegisteredUnaryTransfer()
-    register_gpu_logical_lowerer(_RegisteredUnary, lowerer)
-    try:
-        register_gpu_property_transfer(_RegisteredUnary, transfer)
-        try:
-            with pytest.raises(GPUPlanningError) as captured:
-                Planner().plan(LogicalPlan(grouped, fusion_context))
-        finally:
-            unregister_gpu_property_transfer(_RegisteredUnary, expected=transfer)
-    finally:
-        unregister_gpu_logical_lowerer(_RegisteredUnary, expected=lowerer)
-
-    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
-    assert "registered property transfer failed" in str(captured.value)
-    assert isinstance(captured.value.__cause__, RuntimeError)
-    assert "test concrete property transfer failure" in str(captured.value.__cause__)
-
-
-def test_read_to_mgp_and_repeated_maps(tmp_path, fusion_context):
-    path = _write_parquet(tmp_path)
-    direct = _mgp(_read(path))
-    direct_plan, _ = Planner().plan(direct._logical_plan)
-    assert _kinds(_gpu_ops(direct_plan)[0]) == (
-        "read_parquet_range",
-        "sort_partition",
-        "build_group_boundaries",
-        "map_group_partitions",
-    )
-
-    repeated = _mgp(_map(_map(_read(path)), fn=_Tokenizer2))
-    repeated_plan, _ = Planner().plan(repeated._logical_plan)
-    kinds = _kinds(_gpu_ops(repeated_plan)[0])
-    assert kinds.count("map_batches") == 2
-    assert kinds.count("validate_range_ownership") == 2
-
-
-def test_trailing_map_is_stock(tmp_path, fusion_context):
-    dataset = _map(_pipeline(_write_parquet(tmp_path)), fn=_Tokenizer2)
-    trailing = dataset._logical_plan.dag
-    grouped = trailing.input_dependencies[0]
+def test_exact_gpu_fragment_composes_under_stock_parent(tmp_path, fusion_context):
+    dataset = _pipeline(_write_parquet(tmp_path)).limit(1)
+    parent = dataset._logical_plan.dag
+    grouped = parent.input_dependencies[0]
 
     plan, _ = Planner().plan(dataset._logical_plan)
 
-    assert len(_gpu_ops(plan)) == 1
-    stage = _gpu_ops(plan)[0]
-    assert plan.dag is not stage
-    assert plan.op_map[plan.dag] is trailing
-    assert plan.op_map[stage] is grouped
-    assert trailing not in stage._logical_operators
+    assert len(_planned_ops(plan)) == 3
+    assert plan.op_map[plan.dag] is parent
+    assert plan.op_map[_planned_ops(plan)[-1]] is grouped
+
+    optimized = PhysicalOptimizer().optimize(plan)
+
+    assert len(_actor_ops(optimized)) == 1
+    assert optimized.dag is not _actor_ops(optimized)[0]
+    assert optimized.op_map[optimized.dag] is parent
+    assert optimized.op_map[_actor_ops(optimized)[0]] is grouped
 
 
-def test_immediate_repeated_mgp_is_one_stage(tmp_path, fusion_context):
-    path = _write_parquet(tmp_path)
-    first = _mgp(_map(_read(path)), preserves=True)
-    dataset = _mgp(first, keys=("User", "Merchant"))
-
-    plan, _ = Planner().plan(dataset._logical_plan)
-
-    assert len(_gpu_ops(plan)) == 1
-    kinds = _kinds(_gpu_ops(plan)[0])
-    assert kinds.count("map_group_partitions") == 2
-    assert kinds.count("sort_partition") == 2
-    assert kinds.count("validate_range_ownership") == 2
-
-
-@pytest.mark.parametrize(
-    "second_keys,second_count",
-    [
-        (("Card", "User"), 2),
-        (("User", "Merchant"), 3),
-    ],
-)
-def test_repeated_mgp_incompatible_distribution_requires_exchange(
-    tmp_path, fusion_context, second_keys, second_count
-):
-    first = _mgp(
-        _map(_read(_write_parquet(tmp_path))),
-        preserves=True,
-    )
-    dataset = _mgp(first, keys=second_keys, count=second_count)
-
-    with pytest.raises(GPUPlanningError) as captured:
-        Planner().plan(dataset._logical_plan)
-    assert captured.value.reason is GPUPlanningErrorReason.EXCHANGE_REQUIRED
-    assert "required_keys" in str(captured.value)
-    assert "required_count" in str(captured.value)
-    assert "no GPU exchange is registered" in str(captured.value)
-
-
-def test_property_invalidation_and_profile_mismatch_require_exchange(
-    tmp_path, fusion_context
-):
-    path = _write_parquet(tmp_path)
-    invalidated = _mgp(_map(_map(_read(path)), preserves=False))
-    with pytest.raises(GPUPlanningError) as invalidated_error:
-        Planner().plan(invalidated._logical_plan)
-    assert invalidated_error.value.reason is GPUPlanningErrorReason.EXCHANGE_REQUIRED
-    assert "first_invalidator=MapBatches" in str(invalidated_error.value)
-
-    mismatched = _mgp(_map(_map(_read(path), size=1), size=2))
-    with pytest.raises(GPUPlanningError) as profile_error:
-        Planner().plan(mismatched._logical_plan)
-    assert profile_error.value.reason is GPUPlanningErrorReason.EXCHANGE_REQUIRED
-    assert "mismatched execution profiles" in str(profile_error.value)
-
-
-def test_branch_demands_conflict_or_build_independent_stages(tmp_path, fusion_context):
-    shared = _map(_read(_write_parquet(tmp_path)))
-    first = _mgp(shared, keys=("User", "Card"))
-    conflicting = _mgp(shared, keys=("Card", "User"))
-    with pytest.raises(GPUPlanningError) as conflict:
-        Planner().plan(first.union(conflicting)._logical_plan)
-    assert conflict.value.reason is GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS
-
-    compatible = _mgp(shared, keys=("User", "Merchant"))
-    plan, _ = Planner().plan(first.union(compatible)._logical_plan)
-    assert len(_gpu_ops(plan)) == 2
-    assert all(
-        isinstance(stage.input_dependencies[0], InputDataBuffer)
-        for stage in _gpu_ops(plan)
-    )
-
-
-def test_footer_planning_occurs_only_inside_read_lowering(
+def test_footer_and_range_planning_occurs_only_during_read_lowering(
     tmp_path, fusion_context, monkeypatch
 ):
     from ray.data._internal.planner import parquet_cudf_range_planner
@@ -810,213 +424,93 @@ def test_footer_planning_occurs_only_inside_read_lowering(
 
     monkeypatch.setattr(parquet_cudf_range_planner, "plan_parquet_ranges", tracked)
     dataset = _pipeline(_write_parquet(tmp_path))
-    gate2 = create_gpu_gate2_planner(dataset._logical_plan.dag, dataset.context)
+
+    required_planner = create_gpu_required_fusion_planner(
+        dataset._logical_plan.dag, dataset.context
+    )
     assert calls == []
 
-    planned = gate2.try_plan(dataset._logical_plan.dag, dataset.context)
+    planned = required_planner.try_plan(dataset._logical_plan.dag, dataset.context)
+
     assert planned is not None
     assert len(calls) == 1
-
-
-class _FakeRangeEnforcer:
-    def __init__(self, *, invalid_materialization=False):
-        self.invalid_materialization = invalid_materialization
-        self.calls = []
-
-    def supports(self, request):
-        del request
-        return True
-
-    def established_state(self, request):
-        return GPUPropertyState(
-            facts=(
-                PropertyFact(
-                    RangePartitioning((request.required_keys[0],), "fake-exchange"),
-                    Evidence.OPERATOR_GUARANTEE,
-                ),
-                PropertyFact(
-                    CompletePartitionBundles(),
-                    Evidence.OPERATOR_GUARANTEE,
-                ),
-            ),
-            partition_count=request.required_partition_count,
-        )
-
-    def plan(self, request, *, upstream, data_context):
-        del data_context
-        self.calls.append(request)
-        state = self.established_state(request)
-        if self.invalid_materialization:
-            state = GPUPropertyState(
-                facts=state.facts,
-                partition_count=request.required_partition_count + 1,
-            )
-        return GPUEnforcerPlan(
-            physical_input=upstream,
-            output_state=state,
-            op_map={},
-        )
-
-
-@contextmanager
-def _registered_fake_range_boundary_adapters():
-    """Install the two preserving ports a future enforcer must provide."""
-
-    adapters = tuple(
-        GPUBoundaryAdapter(
-            key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
-            direction=direction,
-            external_payload=PayloadKind.RAY_BLOCK_STREAM,
-            native_payload=PayloadKind.RANGE_DATA,
-            adapt=lambda value, _task_context: value,
-        )
-        for direction in (
-            GPUBoundaryDirection.IMPORT,
-            GPUBoundaryDirection.EXPORT,
-        )
+    assert calls[0][1]["retried_io_errors"] == tuple(
+        fusion_context.retried_io_errors
     )
-    for adapter in adapters:
-        register_gpu_boundary_adapter(adapter)
-    try:
-        yield
-    finally:
-        for adapter in adapters:
-            unregister_gpu_boundary_adapter(
-                key=adapter.key,
-                direction=adapter.direction,
-                external_payload=adapter.external_payload,
-                native_payload=adapter.native_payload,
-            )
-
-
-def test_globally_registered_enforcer_is_used_by_planner(tmp_path, fusion_context):
-    dataset = _mgp(
-        _map(_map(_read(_write_parquet(tmp_path))), preserves=False),
+    read = next(
+        op
+        for op in planned.root.post_order_iter()
+        if isinstance(op, PlannedGPUOperator)
+        and _kinds(op) == ("read_parquet_range",)
     )
-    enforcer = _FakeRangeEnforcer()
-    register_gpu_property_enforcer(enforcer)
-    try:
-        with _registered_fake_range_boundary_adapters():
-            plan, _ = Planner().plan(dataset._logical_plan)
-    finally:
-        unregister_gpu_property_enforcer(enforcer)
-
-    assert len(enforcer.calls) == 1
-    assert len(_gpu_ops(plan)) == 2
+    config = read.gpu_operator_spec.transforms[0].config
+    assert config.source_kind == "local"
+    assert config.range_key == "User"
+    assert config.projection == ("User", "Card", "Merchant", "Value")
+    bundles = read.input_dependencies[0]._input_data_factory(
+        fusion_context.target_max_block_size
+    )
+    assert len(bundles) == 2
 
 
-def test_registered_enforcer_splits_stage_and_carries_validated_state(
+def test_parquet_range_planning_failure_is_stable(
+    tmp_path, fusion_context, monkeypatch
+):
+    from ray.data._internal.planner import parquet_cudf_range_planner
+
+    def fail_range_planning(*args, **kwargs):
+        raise ParquetCudfPlanningError(
+            "key_statistics", "test missing range-key statistics"
+        )
+
+    monkeypatch.setattr(
+        parquet_cudf_range_planner,
+        "plan_parquet_ranges",
+        fail_range_planning,
+    )
+
+    with pytest.raises(GPUPlanningError) as captured:
+        Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
+
+    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+    assert "Parquet range planning failed (key_statistics)" in str(captured.value)
+    assert isinstance(captured.value.__cause__, ParquetCudfPlanningError)
+
+
+def test_retry_policy_is_declared_on_every_spec_and_fused_stage(
     tmp_path, fusion_context
 ):
-    first = _mgp(
-        _map(_map(_read(_write_parquet(tmp_path))), preserves=False),
-        preserves=True,
-    )
-    dataset = _mgp(first, keys=("User", "Merchant"))
-    enforcer = _FakeRangeEnforcer()
-    registry = GPUEnforcerRegistry()
-    registry.register(enforcer)
-    gate2 = create_gpu_gate2_planner(
-        dataset._logical_plan.dag,
-        dataset.context,
-        enforcers=registry,
-    )
+    fusion_context.actor_task_retry_on_errors = [RuntimeError]
+    fusion_context.actor_init_retry_on_errors = True
+    fusion_context.actor_init_max_retries = 5
+    fusion_context.retried_map_errors = ["transient map"]
+    fusion_context.max_map_retries = 7
+    fusion_context.retried_io_errors = ["transient io"]
 
-    with _registered_fake_range_boundary_adapters():
-        planned = gate2.try_plan(dataset._logical_plan.dag, dataset.context)
+    plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
 
-    assert planned is not None
-    assert len(enforcer.calls) == 1
-    gpu_ops = [
-        op for op in planned.root.post_order_iter() if isinstance(op, GPUOperator)
+    policies = [
+        op.gpu_operator_spec.compatibility_key.retry_policy
+        for op in _planned_ops(plan)
     ]
-    assert len(gpu_ops) == 2
-    assert not gpu_ops[0].gpu_operator_spec.uses_terminal_output_adapter
-    assert (
-        gpu_ops[0].gpu_operator_spec.active_output_adapter_key
-        == RANGE_DATA_BOUNDARY_ADAPTER_KEY
-    )
-    assert gpu_ops[1].gpu_operator_spec.uses_terminal_output_adapter
-    assert (
-        gpu_ops[1].gpu_operator_spec.active_output_adapter_key
-        == RANGE_DATA_TERMINAL_ADAPTER_KEY
-    )
-    assert _kinds(planned.root).count("map_group_partitions") == 2
+    assert len(set(policies)) == 1
+    policy = policies[0]
+    assert policy.actor_task_retry_on_errors == (RuntimeError,)
+    assert policy.actor_init_retry_on_errors
+    assert policy.actor_init_max_retries == 5
+    assert policy.retried_map_errors == ("transient map",)
+    assert policy.max_map_retries == 7
+    assert policy.retried_io_errors == ("transient io",)
+    read_config = _planned_ops(plan)[0].gpu_operator_spec.transforms[0].config
+    assert read_config.retried_io_errors == ("transient io",)
+
+    optimized = PhysicalOptimizer().optimize(plan)
+
+    actor = _actor_ops(optimized)[0]
+    assert actor.gpu_operator_spec.compatibility_key.retry_policy == policy
 
 
-def test_profile_boundary_uses_downstream_profile_and_default_partition_count(
-    tmp_path, fusion_context
-):
-    profile_a = _map(_read(_write_parquet(tmp_path)), size=1)
-    profile_b = _map(profile_a, fn=_Tokenizer2, size=2)
-    dataset = _mgp(profile_b, count=None)
-    enforcer = _FakeRangeEnforcer()
-    registry = GPUEnforcerRegistry()
-    registry.register(enforcer)
-    gate2 = create_gpu_gate2_planner(
-        dataset._logical_plan.dag,
-        dataset.context,
-        enforcers=registry,
-    )
-
-    component = gate2.analysis.components_by_anchor[dataset._logical_plan.dag]
-    assert component.mgp_requirements[0].partition_count == 4
-    assert component.source_demand.partition_count == 4
-
-    with _registered_fake_range_boundary_adapters():
-        planned = gate2.try_plan(dataset._logical_plan.dag, dataset.context)
-
-    assert planned is not None
-    assert len(enforcer.calls) == 1
-    request = enforcer.calls[0]
-    assert request.required_partition_count == 4
-    assert request.upstream_execution_requirements.compatibility_key.max_workers == 1
-    assert request.downstream_execution_requirements.compatibility_key.max_workers == 2
-    gpu_ops = [
-        op for op in planned.root.post_order_iter() if isinstance(op, GPUOperator)
-    ]
-    assert len(gpu_ops) == 2
-    assert [op.gpu_operator_spec.compatibility_key.max_workers for op in gpu_ops] == [
-        1,
-        2,
-    ]
-    assert _kinds(gpu_ops[0]) == (
-        "read_parquet_range",
-        "map_batches",
-        "validate_range_ownership",
-    )
-    assert _kinds(gpu_ops[1]) == (
-        "map_batches",
-        "validate_range_ownership",
-        "sort_partition",
-        "build_group_boundaries",
-        "map_group_partitions",
-    )
-
-
-def test_enforcer_materialization_must_match_analyzed_property_state(
-    tmp_path, fusion_context
-):
-    dataset = _mgp(_map(_map(_read(_write_parquet(tmp_path))), preserves=False))
-    enforcer = _FakeRangeEnforcer(invalid_materialization=True)
-    registry = GPUEnforcerRegistry()
-    registry.register(enforcer)
-    gate2 = create_gpu_gate2_planner(
-        dataset._logical_plan.dag,
-        dataset.context,
-        enforcers=registry,
-    )
-
-    with (
-        _registered_fake_range_boundary_adapters(),
-        pytest.raises(GPUPlanningError) as captured,
-    ):
-        gate2.try_plan(dataset._logical_plan.dag, dataset.context)
-    assert captured.value.reason is GPUPlanningErrorReason.EXCHANGE_REQUIRED
-    assert "did not establish" in str(captured.value)
-
-
-def test_unresolved_final_obligation_is_a_stable_planning_error(
+def test_unresolved_final_obligation_fails_during_physical_fusion(
     tmp_path, fusion_context, monkeypatch
 ):
     original_lower = GPUMapGroupPartitionsLowerer.lower
@@ -1039,13 +533,12 @@ def test_unresolved_final_obligation_is_a_stable_planning_error(
         "lower",
         lower_with_unresolved_output,
     )
+    plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
+    assert len(_planned_ops(plan)) == 3
 
-    with pytest.raises(GPUPlanningError) as captured:
-        dataset = _mgp(_read(_write_parquet(tmp_path)))
-        Planner().plan(dataset._logical_plan)
+    with pytest.raises(GPURequiredFusionError) as captured:
+        PhysicalOptimizer().optimize(plan)
 
-    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
-    assert "gate-2 final GPU stage composition refused" in str(captured.value)
     assert isinstance(captured.value.__cause__, GPUCompositionError)
     assert (
         captured.value.__cause__.reason
@@ -1053,7 +546,9 @@ def test_unresolved_final_obligation_is_a_stable_planning_error(
     )
 
 
-def test_missing_terminal_adapter_is_a_stable_planning_error(tmp_path, fusion_context):
+def test_missing_terminal_adapter_fails_during_physical_materialization(
+    tmp_path, fusion_context
+):
     adapter = get_gpu_boundary_adapter(
         key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
         direction=GPUBoundaryDirection.EXPORT,
@@ -1069,50 +564,54 @@ def test_missing_terminal_adapter_is_a_stable_planning_error(tmp_path, fusion_co
     )
     assert removed is adapter
     try:
-        with pytest.raises(GPUPlanningError) as captured:
-            dataset = _mgp(_read(_write_parquet(tmp_path)))
-            Planner().plan(dataset._logical_plan)
+        plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
+        assert len(_planned_ops(plan)) == 3
+        with pytest.raises(GPURequiredFusionError) as captured:
+            PhysicalOptimizer().optimize(plan)
     finally:
         register_gpu_boundary_adapter(adapter)
 
-    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
-    assert "factory or boundary adapter refused" in str(captured.value)
-    assert type(captured.value.__cause__) is ValueError
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert "backend materialization failed" in str(captured.value)
 
 
 @pytest.mark.parametrize("factory_mode", ["absent", "refusing"])
-def test_absent_or_refusing_gpu_factory_is_a_stable_planning_error(
+def test_absent_or_refusing_gpu_factory_fails_only_during_physical_materialization(
     tmp_path, fusion_context, monkeypatch, factory_mode
 ):
-    import ray.data._internal.execution.gpu.operator as gpu_operator_module
-
     class RefusingFactory:
+        def __init__(self):
+            self.support_calls = 0
+
         def supports(self, spec):
             del spec
+            self.support_calls += 1
             return False
 
         def create(self, *args, **kwargs):
             raise AssertionError("a refusing factory must not be invoked")
 
+    refusing = RefusingFactory()
     if factory_mode == "absent":
-        monkeypatch.delitem(
-            gpu_operator_module._GPU_OPERATOR_FACTORIES,
-            "actor_pool",
-        )
+        monkeypatch.delitem(gpu_operator_module._GPU_OPERATOR_FACTORIES, "actor_pool")
     else:
         monkeypatch.setitem(
             gpu_operator_module._GPU_OPERATOR_FACTORIES,
             "actor_pool",
-            RefusingFactory(),
+            refusing,
         )
 
-    with pytest.raises(GPUPlanningError) as captured:
-        dataset = _mgp(_read(_write_parquet(tmp_path)))
-        Planner().plan(dataset._logical_plan)
+    plan, _ = Planner().plan(_pipeline(_write_parquet(tmp_path))._logical_plan)
 
-    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
-    assert "factory or boundary adapter refused" in str(captured.value)
-    assert type(captured.value.__cause__) is ValueError
+    assert len(_planned_ops(plan)) == 3
+    assert refusing.support_calls == 0
+    with pytest.raises(GPURequiredFusionError) as captured:
+        PhysicalOptimizer().optimize(plan)
+
+    assert isinstance(captured.value.__cause__, ValueError)
+    assert "backend materialization failed" in str(captured.value)
+    if factory_mode == "refusing":
+        assert refusing.support_calls == 1
 
 
 def test_read_placement_is_folded_or_rejected(tmp_path, fusion_context):
@@ -1120,9 +619,13 @@ def test_read_placement_is_folded_or_rejected(tmp_path, fusion_context):
     inherited = _mgp(
         _map(_read(path, ray_remote_args={"scheduling_strategy": "SPREAD"}))
     )
+
     plan, _ = Planner().plan(inherited._logical_plan)
-    key = _gpu_ops(plan)[0].gpu_operator_spec.compatibility_key
-    assert key.scheduling_strategy == "SPREAD"
+
+    keys = [op.gpu_operator_spec.compatibility_key for op in _planned_ops(plan)]
+    assert all(key.scheduling_strategy == "SPREAD" for key in keys)
+    optimized = PhysicalOptimizer().optimize(plan)
+    assert _actor_ops(optimized)[0].gpu_operator_spec.compatibility_key == keys[0]
 
     conflict = _mgp(
         _map(
@@ -1135,10 +638,28 @@ def test_read_placement_is_folded_or_rejected(tmp_path, fusion_context):
     assert captured.value.reason is GPUPlanningErrorReason.CONFLICTING_REQUIREMENTS
 
 
-def test_flag_off_mgp_fails_stably_but_no_mgp_stays_stock(tmp_path, fusion_context):
+def test_exact_shape_and_partition_preservation_are_required(
+    tmp_path, fusion_context
+):
     path = _write_parquet(tmp_path)
-    stock_enabled = _map(_read(path))
-    enabled_plan, _ = Planner().plan(stock_enabled._logical_plan)
+
+    with pytest.raises(GPUPlanningError) as direct_error:
+        Planner().plan(_mgp(_read(path))._logical_plan)
+    assert direct_error.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+    assert "exactly Read -> one cuDF MapBatches" in str(direct_error.value)
+
+    with pytest.raises(GPUPlanningError) as property_error:
+        Planner().plan(_mgp(_map(_read(path), preserves=False))._logical_plan)
+    assert property_error.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+    assert "preserves_partitioning=True" in str(property_error.value)
+
+
+def test_flag_off_mgp_fails_stably_but_no_mgp_stays_stock(
+    tmp_path, fusion_context
+):
+    path = _write_parquet(tmp_path)
+    standalone = _map(_read(path))
+    enabled_plan, _ = Planner().plan(standalone._logical_plan)
     assert _gpu_ops(enabled_plan) == []
 
     dataset = _pipeline(path)
@@ -1154,13 +675,15 @@ def test_flag_off_mgp_fails_stably_but_no_mgp_stays_stock(tmp_path, fusion_conte
     assert _gpu_ops(stock_plan) == []
 
 
-def test_checkpointed_mgp_is_rejected_during_analysis(tmp_path, fusion_context):
+def test_checkpointed_exact_gpu_pipeline_is_rejected(tmp_path, fusion_context):
     dataset = _pipeline(_write_parquet(tmp_path))
     dataset.context.checkpoint_config = {
         "id_column": "User",
         "checkpoint_path": str(tmp_path / "checkpoint"),
     }
+
     with pytest.raises(GPUPlanningError) as captured:
         Planner().plan(dataset._logical_plan)
+
     assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
     assert "checkpointing" in str(captured.value)

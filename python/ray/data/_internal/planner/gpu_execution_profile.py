@@ -1,4 +1,4 @@
-"""Canonical Ray ActorPool execution profiles for gate-2 GPU planning."""
+"""Canonical Ray ActorPool execution profile for required GPU fusion."""
 
 from __future__ import annotations
 
@@ -162,19 +162,6 @@ def canonical_gpu_execution_requirements(
     )
 
 
-def default_gpu_execution_requirements(
-    data_context: DataContext,
-) -> GPUExecutionRequirements:
-    """Profile for the valid Read -> MGP case with no MapBatches profile."""
-
-    return canonical_gpu_execution_requirements(
-        compute=ActorPoolStrategy(),
-        resources={"num_cpus": 1, "num_gpus": 1},
-        data_context=data_context,
-        consumer="Read->MapGroupPartitions",
-    )
-
-
 def reconcile_read_remote_args(
     requirements: GPUExecutionRequirements,
     read_remote_args: Mapping[str, Any],
@@ -260,6 +247,5 @@ def _runtime_env_serialized(value: Any) -> Optional[str]:
 
 __all__ = [
     "canonical_gpu_execution_requirements",
-    "default_gpu_execution_requirements",
     "reconcile_read_remote_args",
 ]

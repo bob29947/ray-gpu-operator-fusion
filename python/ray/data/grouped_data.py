@@ -349,21 +349,21 @@ class GroupedData:
     ) -> "Dataset":
         """Apply a GPU function to partitions containing complete groups.
 
-        This is an explicit opt-in fast path for a supported Parquet read followed
-        by GPU-eligible :meth:`~ray.data.Dataset.map_batches` and
-        ``map_group_partitions`` operations. Ray plans disjoint ranges from the
+        This is an explicit opt-in fast path for exactly one supported Parquet
+        read, one GPU-eligible :meth:`~ray.data.Dataset.map_batches`, and this
+        ``map_group_partitions`` operation. Ray plans disjoint ranges from the
         leading group key, sorts each complete partition by all group keys, and
         invokes ``fn`` for every nonempty partition. ``fn`` receives the cuDF
         partition and a :class:`MapGroupPartitionsContext`.
 
         Before constructing the Dataset, set
         ``DataContext.get_current().enable_gpu_operator_fusion = True``. A GPU
-        operation whose output must feed a later partition-dependent
-        operation must pass ``UDFProperties(preserves_partitioning=True)``. The
-        backend validates that output rows remain in the assigned leading-key
-        range. Unlike :meth:`map_groups`, this API has no general-purpose stock
-        fallback and raises an actionable planning error when gate 2 can't build a
-        valid GPU stage.
+        immediately upstream ``map_batches`` must pass
+        ``UDFProperties(preserves_partitioning=True)``. The backend validates
+        that its output rows remain in the assigned leading-key range. Unlike
+        :meth:`map_groups`, this API has no general-purpose stock fallback and
+        raises an actionable error unless the physical optimizer can fuse the
+        complete three-operator GPU region.
 
         Ray may invoke ``fn`` again after a retry or actor restart. Side effects
         therefore have at-least-once semantics; execution is not exactly once.

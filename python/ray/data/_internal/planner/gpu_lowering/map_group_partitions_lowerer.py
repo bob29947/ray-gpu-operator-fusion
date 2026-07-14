@@ -11,10 +11,6 @@ from ray.data._internal.execution.gpu import (
     RANGE_DATA_BOUNDARY_ADAPTER_KEY,
     RANGE_DATA_TERMINAL_ADAPTER_KEY,
 )
-from ray.data._internal.execution.gpu.properties import (
-    PartitioningPreservationError,
-    readvertise_preserved_properties,
-)
 from ray.data._internal.execution.gpu.transforms.grouped_partitions import (
     BUILD_GROUP_BOUNDARIES_KIND,
     MAP_GROUP_PARTITIONS_KIND,
@@ -25,20 +21,13 @@ from ray.data._internal.execution.gpu.transforms.grouped_partitions import (
 )
 from ray.data._internal.logical.operators import MapGroupPartitions
 from ray.data._internal.planner.gpu_lowering.interfaces import (
-    GPUComponentRole,
     GPULogicalAnalysis,
     GPULoweredOperator,
     GPULoweringContext,
 )
-from ray.data._internal.planner.gpu_planning_errors import (
-    GPUPlanningError,
-    GPUPlanningErrorReason,
-)
 
 
 class GPUMapGroupPartitionsLowerer:
-    component_role = GPUComponentRole.PARTITION_CONSUMER
-
     def analyze(
         self, logical_op: MapGroupPartitions, data_context
     ) -> GPULogicalAnalysis:
@@ -96,24 +85,6 @@ class GPUMapGroupPartitionsLowerer:
                 "MGP lowering context group_keys must match the logical operator"
             )
 
-        preserves = bool(
-            logical_op.udf_properties is not None
-            and logical_op.udf_properties.preserves_partitioning
-        )
-        try:
-            readvertisement = readvertise_preserved_properties(
-                context.input_properties,
-                preserves_partitioning=preserves,
-                # MGP can advertise a complete output partition only when the
-                # partition identity itself survives its UDF.
-                preserves_complete_partition_bundles=preserves,
-            )
-        except PartitioningPreservationError as error:
-            raise GPUPlanningError(
-                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                f"consumer=MapGroupPartitions({logical_op.name}); {error}",
-            ) from error
-
         transforms = [
             GPUTransformSpec(
                 transform_id=context.transform_id(0, SORT_PARTITION_KIND),
@@ -140,24 +111,8 @@ class GPUMapGroupPartitionsLowerer:
                     group_keys=context.group_keys,
                     target_max_block_size=context.target_max_block_size,
                 ),
-                creates_obligations=readvertisement.created_obligations,
             ),
         ]
-
-        for ordinal, validation in enumerate(
-            readvertisement.partitioning_validations,
-            start=3,
-        ):
-            transforms.append(
-                GPUTransformSpec(
-                    transform_id=context.transform_id(ordinal, validation.kind),
-                    kind=validation.kind,
-                    input_payload=PayloadKind.RANGE_DATA,
-                    output_payload=PayloadKind.RANGE_DATA,
-                    config=validation.config,
-                    discharges_obligations=validation.obligations,
-                )
-            )
 
         spec = GPUOperatorSpec(
             spec_instance_id=context.logical_node_id,
@@ -174,7 +129,9 @@ class GPUMapGroupPartitionsLowerer:
                 KeysColocated(context.group_keys),
                 CompletePartitionBundles(),
             ),
-            output_properties=readvertisement.output_properties,
+            # MGP is the V1 GPU-region terminal.  No downstream GPU property
+            # is advertised until an explicit inter-stage boundary exists.
+            output_properties=(),
             logical_provenance=(context.logical_node_id,),
         )
         downstream_context = context.for_lowered_output(spec)

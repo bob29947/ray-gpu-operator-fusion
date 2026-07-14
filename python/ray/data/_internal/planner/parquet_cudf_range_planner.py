@@ -348,10 +348,19 @@ def plan_parquet_ranges(
     range_key: str,
     target_ranges: int,
     num_workers: int,
+    retried_io_errors: tuple[str, ...] = (),
 ) -> ParquetRangePlan:
     """Perform footer analysis and return serializable actor work."""
 
-    footer = read_footer_summary(read, range_key)
+    from ray.data._internal.util import iterate_with_retry
+
+    footer = next(
+        iterate_with_retry(
+            lambda: (read_footer_summary(read, range_key),),
+            "read Parquet footer metadata",
+            match=list(retried_io_errors),
+        )
+    )
     return build_range_plan(
         footer,
         range_key=range_key,

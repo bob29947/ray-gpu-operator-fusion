@@ -11,8 +11,12 @@ from ray.data._internal.execution.gpu import (
     RANGE_DATA_TERMINAL_ADAPTER_KEY,
 )
 from ray.data._internal.execution.gpu.properties import (
+    CompletePartitionBundles,
     PartitioningPreservationError,
+    RangePartitioning,
+    RangePartitioningRequired,
     readvertise_preserved_properties,
+    usable_partitioning_fact,
 )
 from ray.data._internal.execution.gpu.transforms.map_batches import (
     MAP_BATCHES_KIND,
@@ -20,7 +24,6 @@ from ray.data._internal.execution.gpu.transforms.map_batches import (
 )
 from ray.data._internal.logical.operators import MapBatches
 from ray.data._internal.planner.gpu_lowering.interfaces import (
-    GPUComponentRole,
     GPULogicalAnalysis,
     GPULoweredOperator,
     GPULoweringContext,
@@ -35,8 +38,6 @@ from ray.data._internal.planner.gpu_planning_errors import (
 
 
 class GPUMapBatchesLowerer:
-    component_role = GPUComponentRole.UNARY
-
     def analyze(self, logical_op: MapBatches, data_context) -> GPULogicalAnalysis:
         if type(logical_op) is not MapBatches:
             return GPULogicalAnalysis(False, "logical_map_batches")
@@ -102,6 +103,24 @@ class GPUMapBatchesLowerer:
                 f"consumer=MapBatches({logical_op.name}); {error}",
             ) from error
 
+        input_requirements = []
+        partitioning = usable_partitioning_fact(context.input_properties)
+        if preserves and partitioning is not None:
+            value = partitioning.value
+            if not isinstance(value, RangePartitioning):
+                raise GPUPlanningError(
+                    GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+                    "consumer=MapBatches; V1 can preserve only RangePartitioning",
+                )
+            input_requirements.append(
+                RangePartitioningRequired(value.keys, value.scheme_id)
+            )
+        if any(
+            isinstance(fact.value, CompletePartitionBundles)
+            for fact in readvertisement.output_properties
+        ):
+            input_requirements.append(CompletePartitionBundles())
+
         transforms = [
             GPUTransformSpec(
                 transform_id=context.transform_id(0, MAP_BATCHES_KIND),
@@ -138,6 +157,7 @@ class GPUMapBatchesLowerer:
             output_adapter_key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
             terminal_output_adapter_key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
             execution_requirements=context.execution_requirements,
+            input_requirements=tuple(input_requirements),
             output_properties=readvertisement.output_properties,
             logical_provenance=(context.logical_node_id,),
         )

@@ -78,15 +78,10 @@ def test_parquet_map_group_partitions_executes_one_fused_gpu_operator(
         .map_group_partitions(identity_partition)
     )
 
-    # Gate 2 must already have built a valid executable stage.  Exercise it with
-    # the optional physical GPU fusion rule absent, rather than merely checking
-    # the pre-optimizer plan structure.
-    physical_rules = get_physical_ruleset()
-    physical_rules.remove(FuseGPUOperators)
-    try:
-        rows = output.take_all()
-    finally:
-        physical_rules.add(FuseGPUOperators)
+    # Required fusion follows the ordinary physical-optimization path: the
+    # planner emits deferred nodes and FuseGPUOperators materializes one actor.
+    assert FuseGPUOperators in tuple(get_physical_ruleset())
+    rows = output.take_all()
     assert len({row.pop("tokenizer_instance") for row in rows}) == 1
     rows.sort(key=lambda row: (row["User"], row["Card"]))
     assert rows == [

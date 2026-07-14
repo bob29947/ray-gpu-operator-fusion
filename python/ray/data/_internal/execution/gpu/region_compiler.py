@@ -17,12 +17,10 @@ def compile_gpu_region(
     *,
     require_resolved_output: bool = True,
 ) -> GPUOperatorSpec:
-    """Fold adjacent specs and optionally require a sealed-stage output.
+    """Fold adjacent specs and optionally require a fully validated output.
 
-    Gate 2 uses ``require_resolved_output=False`` while probing a partial
-    component prefix because a later operator may discharge an obligation.
-    Final stage construction and physical fusion keep the default and reject
-    any obligation that would escape an executable stage.
+    Required physical fusion keeps the default and rejects any validation
+    obligation that would escape the one executable stage.
     """
 
     specs = tuple(specs)

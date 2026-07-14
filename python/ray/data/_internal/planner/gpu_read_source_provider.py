@@ -1,9 +1,9 @@
-"""Additive source-provider seam invoked from generic GPU Read lowering."""
+"""Read-source contract and the V1 Parquet range implementation."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, Protocol, Tuple
+from typing import Any, Callable, Protocol, Tuple
 
 from ray.data._internal.execution.gpu.operator import GPUOperatorCreationOptions
 from ray.data._internal.execution.gpu.operator_spec import (
@@ -107,68 +107,6 @@ class GPUReadSourceProvider(Protocol):
     ) -> GPUReadSourceLowering: ...
 
 
-class GPUReadSourceProviderRegistry:
-    """Ordered capability registry; selection performs no footer/range I/O."""
-
-    def __init__(self) -> None:
-        self._providers: Dict[str, GPUReadSourceProvider] = {}
-
-    def register(self, provider: GPUReadSourceProvider) -> None:
-        name = provider.provider_name
-        if not name:
-            raise ValueError("GPU source provider_name must be nonempty")
-        if name in self._providers:
-            raise ValueError(f"GPU source provider already registered: {name}")
-        self._providers[name] = provider
-
-    def unregister(
-        self,
-        provider_name: str,
-        *,
-        expected: GPUReadSourceProvider | None = None,
-    ) -> GPUReadSourceProvider:
-        """Remove one provider, optionally guarding against stale cleanup."""
-
-        try:
-            provider = self._providers[provider_name]
-        except KeyError as exc:
-            raise KeyError(
-                f"GPU source provider is not registered: {provider_name}"
-            ) from exc
-        if expected is not None and provider is not expected:
-            raise ValueError(
-                f"GPU source provider {provider_name!r} is not the expected instance"
-            )
-        del self._providers[provider_name]
-        return provider
-
-    def copy(self) -> "GPUReadSourceProviderRegistry":
-        """Return a plan-local snapshot preserving provider selection order."""
-
-        registry = GPUReadSourceProviderRegistry()
-        registry._providers.update(self._providers)
-        return registry
-
-    def select(
-        self,
-        logical_op: LogicalOperator,
-        demand: GPUReadSourceDemand,
-    ) -> GPUReadSourceProvider:
-        refusals = []
-        for provider in self._providers.values():
-            support = provider.supports(logical_op, demand)
-            if support.accepted:
-                return provider
-            refusals.append((provider.provider_name, support.reason))
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-            f"consumer={type(logical_op).__name__}; "
-            f"required_keys={demand.group_keys!r}; "
-            f"required_count={demand.target_ranges}; no registered GPU Read "
-            f"source provider accepted the source; refusals={tuple(refusals)!r}",
-        )
-
-
 class ParquetRangeGPUReadProvider:
     """The only V1 source: a direct Parquet/cuDF range Read."""
 
@@ -243,6 +181,7 @@ class ParquetRangeGPUReadProvider:
                 range_key=request.group_keys[0],
                 target_ranges=request.target_ranges,
                 num_workers=request.num_workers,
+                retried_io_errors=request.retried_io_errors,
             )
         except ParquetCudfPlanningError as error:
             raise GPUPlanningError(
@@ -338,47 +277,12 @@ def _requirements_for_source(
     )
 
 
-_REGISTERED_GPU_SOURCE_PROVIDERS = GPUReadSourceProviderRegistry()
-_REGISTERED_GPU_SOURCE_PROVIDERS.register(ParquetRangeGPUReadProvider())
-
-
-def register_gpu_read_source_provider(provider: GPUReadSourceProvider) -> None:
-    """Register a provider used by every subsequently planned logical plan."""
-
-    _REGISTERED_GPU_SOURCE_PROVIDERS.register(provider)
-
-
-def unregister_gpu_read_source_provider(
-    provider_name: str,
-    *,
-    expected: GPUReadSourceProvider | None = None,
-) -> GPUReadSourceProvider:
-    """Unregister a provider; intended for plugin teardown and test isolation."""
-
-    if provider_name == ParquetRangeGPUReadProvider.provider_name:
-        raise ValueError("The built-in Parquet GPU source provider cannot be removed")
-    return _REGISTERED_GPU_SOURCE_PROVIDERS.unregister(
-        provider_name,
-        expected=expected,
-    )
-
-
-def create_default_gpu_source_provider_registry() -> GPUReadSourceProviderRegistry:
-    """Snapshot all built-in and globally registered source providers."""
-
-    return _REGISTERED_GPU_SOURCE_PROVIDERS.copy()
-
-
 __all__ = [
     "GPUReadLoweringRequest",
     "GPUReadSourceArtifacts",
     "GPUReadSourceDemand",
     "GPUReadSourceLowering",
     "GPUReadSourceProvider",
-    "GPUReadSourceProviderRegistry",
     "GPUReadSourceSupport",
     "ParquetRangeGPUReadProvider",
-    "create_default_gpu_source_provider_registry",
-    "register_gpu_read_source_provider",
-    "unregister_gpu_read_source_provider",
 ]

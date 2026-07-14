@@ -1,4 +1,29 @@
+"""Tests for the closed V1 GPU planner shape.
+
+The production requirement-analysis registry was intentionally removed.  These
+tests cover the smaller contract that replaced it: one unshared
+Read -> preserving cuDF MapBatches -> MapGroupPartitions region is lowered to
+three deferred physical nodes.
+"""
+
+import pytest
+
 from ray.data import ActorPoolStrategy, UDFProperties
+from ray.data._internal.execution.gpu import (
+    CompletePartitionBundles,
+    Evidence,
+    GPUOperatorCreationOptions,
+    GPUOperatorSpec,
+    GPUTransformSpec,
+    PayloadKind,
+    PlannedGPUOperator,
+    PropertyFact,
+    RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    RANGE_DATA_TERMINAL_ADAPTER_KEY,
+    RANGE_WORK_ADAPTER_KEY,
+    RangePartitioning,
+    RangePartitioningRequired,
+)
 from ray.data._internal.logical.operators import (
     Limit,
     MapBatches,
@@ -6,29 +31,16 @@ from ray.data._internal.logical.operators import (
     Read,
     Union,
 )
-from ray.data._internal.logical.interfaces import LogicalOperator
-from ray.data._internal.planner.gpu_lowering import (
-    GPUComponentRole,
-    GPULogicalAnalysis,
+from ray.data._internal.planner.gpu_plan_provider import (
+    create_gpu_required_fusion_planner,
 )
-from ray.data._internal.planner.gpu_requirement_analysis import (
-    GPUEnforcerRegistry,
+from ray.data._internal.planner.gpu_planning_errors import (
     GPUPlanningError,
     GPUPlanningErrorReason,
-    GPUPropertyState,
-    analyze_gpu_requirements,
-    create_default_gpu_lowerer_registry,
-)
-from ray.data._internal.execution.gpu import (
-    CompletePartitionBundles,
-    Evidence,
-    GPUExecutionCompatibilityKey,
-    GPUExecutionRequirements,
-    PropertyFact,
-    RangePartitioning,
 )
 from ray.data._internal.planner.gpu_read_source_provider import (
-    GPUReadSourceProviderRegistry,
+    GPUReadSourceArtifacts,
+    GPUReadSourceLowering,
     GPUReadSourceSupport,
 )
 from ray.data.context import DataContext
@@ -44,48 +56,71 @@ class _GPUMap:
         return batch
 
 
-class _CustomLogicalSource(LogicalOperator):
-    def __init__(self):
-        object.__setattr__(self, "_input_dependencies", [])
-        object.__setattr__(self, "_name", "CustomGPUInput")
-
-
-class _CustomSourceLowerer:
-    component_role = GPUComponentRole.SOURCE
-
-    def __init__(self, execution_requirements):
-        self._execution_requirements = execution_requirements
-
-    def analyze(self, logical_op, data_context):
-        del data_context
-        if type(logical_op) is not _CustomLogicalSource:
-            return GPULogicalAnalysis(False, "custom_source")
-        return GPULogicalAnalysis(
-            True,
-            None,
-            execution_requirements=self._execution_requirements,
-        )
-
-    def lower(self, logical_op, context):
-        del logical_op, context
-        raise AssertionError("requirement analysis must not lower a source")
-
-
-class _TestSourceProvider:
-    provider_name = "test"
-
-    def supports(self, logical_op, demand):
-        del logical_op, demand
-        return GPUReadSourceSupport(True)
-
-    def lower(self, logical_op, request):
-        del logical_op, request
-        raise AssertionError("requirement analysis must not lower a source")
-
-
 def _partition_fn(frame, context):
     del context
     return frame
+
+
+class _StubReadProvider:
+    """Plan-local source double; it is not installed in any global registry."""
+
+    provider_name = "test_v1_source"
+
+    def __init__(self):
+        self.support_calls = 0
+        self.lower_calls = 0
+
+    def supports(self, logical_op, demand):
+        self.support_calls += 1
+        accepted = type(logical_op) is Read and bool(demand.group_keys)
+        return GPUReadSourceSupport(accepted, "logical_read" if not accepted else "")
+
+    def lower(self, logical_op, request):
+        assert type(logical_op) is Read
+        self.lower_calls += 1
+        properties = (
+            PropertyFact(
+                RangePartitioning((request.group_keys[0],), "test-range-scheme"),
+                Evidence.OPERATOR_GUARANTEE,
+            ),
+            PropertyFact(
+                CompletePartitionBundles(),
+                Evidence.OPERATOR_GUARANTEE,
+            ),
+        )
+        spec = GPUOperatorSpec(
+            spec_instance_id=request.logical_node_id,
+            transforms=(
+                GPUTransformSpec(
+                    transform_id=request.transform_id(0, "read_parquet_range"),
+                    kind="read_parquet_range",
+                    input_payload=PayloadKind.RANGE_WORK,
+                    output_payload=PayloadKind.RANGE_DATA,
+                ),
+            ),
+            external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
+            external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
+            native_input_payload=PayloadKind.RANGE_WORK,
+            native_output_payload=PayloadKind.RANGE_DATA,
+            input_adapter_key=RANGE_WORK_ADAPTER_KEY,
+            output_adapter_key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+            terminal_output_adapter_key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
+            execution_requirements=request.execution_requirements,
+            output_properties=properties,
+            logical_provenance=(request.logical_node_id,),
+        )
+        return GPUReadSourceLowering(
+            spec=spec,
+            creation_options=GPUOperatorCreationOptions(
+                name="GPUReadParquetRange",
+                min_rows_per_bundle=1,
+                target_max_block_size_override=request.target_max_block_size,
+            ),
+            artifacts=GPUReadSourceArtifacts(
+                input_data_factory=lambda _target_size: [],
+                provider_artifacts="test-range-work",
+            ),
+        )
 
 
 def _read():
@@ -97,13 +132,13 @@ def _read():
     )
 
 
-def _map(parent, *, preserves=True, size=1):
+def _map(parent, *, preserves=True, batch_format="cudf"):
     return MapBatches(
         fn=_GPUMap,
         input_dependencies=[parent],
         batch_size=8,
-        batch_format="cudf",
-        compute=ActorPoolStrategy(size=size),
+        batch_format=batch_format,
+        compute=ActorPoolStrategy(size=1),
         ray_remote_args={"num_cpus": 1, "num_gpus": 1},
         udf_properties=(
             UDFProperties(preserves_partitioning=True) if preserves else None
@@ -111,219 +146,159 @@ def _map(parent, *, preserves=True, size=1):
     )
 
 
-def _mgp(parent, *, keys=("user", "card"), preserves=False, count=2):
+def _mgp(parent):
     return MapGroupPartitions(
-        key=list(keys),
-        num_partitions=count,
+        key=["user", "card"],
+        num_partitions=2,
         fn=_partition_fn,
-        udf_properties=(
-            UDFProperties(preserves_partitioning=True) if preserves else None
-        ),
         input_dependencies=[parent],
     )
 
 
-def _analyze(root, *, enforcers=None):
-    providers = GPUReadSourceProviderRegistry()
-    providers.register(_TestSourceProvider())
-    return analyze_gpu_requirements(
-        root,
-        DataContext.get_current(),
-        source_providers=providers,
-        enforcers=enforcers,
+def _context():
+    context = DataContext.get_current().copy()
+    context.enable_gpu_operator_fusion = True
+    context.checkpoint_config = None
+    return context
+
+
+def _planner(root, provider=None):
+    context = _context()
+    return (
+        create_gpu_required_fusion_planner(
+            root,
+            context,
+            source_provider=provider or _StubReadProvider(),
+        ),
+        context,
     )
 
 
-def test_repeated_mgp_is_one_maximal_component():
-    read = _read()
-    mapped = _map(read)
-    first = _mgp(mapped, preserves=True)
-    last = _mgp(first)
-
-    analysis = _analyze(last)
-
-    assert tuple(analysis.components_by_anchor) == (last,)
-    component = analysis.components_by_anchor[last]
-    assert component.operators == (read, mapped, first, last)
-    assert [requirement.operator for requirement in component.mgp_requirements] == [
-        first,
-        last,
+def _planned_nodes(root):
+    return [
+        op for op in root.post_order_iter() if isinstance(op, PlannedGPUOperator)
     ]
-    assert [
-        membership.component_id
-        for membership in analysis.annotations[first].memberships
-    ] == [component.component_id]
 
 
-def test_trailing_map_is_stock_and_not_component_member():
+def test_exact_v1_planner_emits_three_independent_required_fusion_nodes():
     read = _read()
     mapped = _map(read)
     grouped = _mgp(mapped)
-    trailing = _map(grouped, preserves=True)
+    provider = _StubReadProvider()
+    planner, context = _planner(grouped, provider)
 
-    analysis = _analyze(trailing)
+    assert provider.support_calls == 0
+    assert provider.lower_calls == 0
 
-    assert tuple(analysis.components_by_anchor) == (grouped,)
-    assert analysis.components_by_anchor[grouped].operators == (
-        read,
-        mapped,
-        grouped,
-    )
-    assert analysis.annotations[trailing].memberships == ()
+    planned = planner.try_plan(grouped, context)
 
-
-def test_invalidation_before_later_mgp_requires_exchange():
-    read = _read()
-    first = _mgp(_map(read), preserves=True)
-    invalidating_map = _map(first, preserves=False)
-    last = _mgp(invalidating_map)
-
-    try:
-        _analyze(last)
-    except GPUPlanningError as error:
-        assert error.reason is GPUPlanningErrorReason.EXCHANGE_REQUIRED
-        assert "first_invalidator=MapBatches" in str(error)
-        assert "no GPU exchange is registered" in str(error)
-    else:
-        raise AssertionError("property invalidation must refuse the later MGP")
-
-
-def test_branch_ending_at_earlier_mgp_gets_its_own_component():
-    read = _read()
-    first = _mgp(_map(read), preserves=True)
-    continued = _mgp(first)
-    stock_branch = Limit(1, input_dependencies=[first])
-    root = Union([continued, stock_branch])
-
-    analysis = _analyze(root)
-
-    assert set(analysis.components_by_anchor) == {first, continued}
-    assert analysis.components_by_anchor[first].operators[-1] is first
-    assert analysis.components_by_anchor[continued].operators[-1] is continued
-    assert len(analysis.annotations[first].memberships) == 2
-
-
-class _RecordingEnforcer:
-    def __init__(self):
-        self.requests = []
-
-    def supports(self, request):
-        del request
-        return True
-
-    def established_state(self, request):
-        self.requests.append(request)
-        return GPUPropertyState(
-            facts=(
-                PropertyFact(
-                    RangePartitioning((request.required_keys[0],), "test-exchange"),
-                    Evidence.OPERATOR_GUARANTEE,
-                ),
-                PropertyFact(
-                    CompletePartitionBundles(),
-                    Evidence.OPERATOR_GUARANTEE,
-                ),
-            ),
-            partition_count=request.required_partition_count,
-        )
-
-    def plan(self, request, *, upstream, data_context):
-        del request, upstream, data_context
-        raise AssertionError("analysis must not construct an enforcer")
-
-
-def test_every_adjacent_execution_profile_boundary_is_annotated():
-    read = _read()
-    profile_a = _map(read, size=1)
-    profile_b = _map(profile_a, size=2)
-    profile_a_again = _map(profile_b, size=1)
-    grouped = _mgp(profile_a_again, count=None)
-    enforcer = _RecordingEnforcer()
-    registry = GPUEnforcerRegistry()
-    registry.register(enforcer)
-
-    analysis = _analyze(grouped, enforcers=registry)
-    component = analysis.components_by_anchor[grouped]
-
-    assert len(enforcer.requests) == 2
+    assert planned is not None
+    nodes = _planned_nodes(planned.root)
+    assert len(nodes) == 3
+    read_node, map_node, mgp_node = nodes
+    assert read_node.input_dependencies == [next(iter(planned.op_map))]
+    assert map_node.input_dependencies == [read_node]
+    assert mgp_node.input_dependencies == [map_node]
     assert [
-        (
-            request.upstream_execution_requirements.compatibility_key.max_workers,
-            request.downstream_execution_requirements.compatibility_key.max_workers,
-        )
-        for request in enforcer.requests
-    ] == [(1, 2), (2, 1)]
-    assert component.mgp_requirements[0].partition_count == 2
-    assert [
-        analysis.annotations[op]
-        .memberships[0]
-        .execution_requirements.compatibility_key.max_workers
-        for op in (read, profile_a, profile_b, profile_a_again, grouped)
-    ] == [1, 1, 2, 1, 1]
+        tuple(transform.kind for transform in node.gpu_operator_spec.transforms)
+        for node in nodes
+    ] == [
+        ("read_parquet_range",),
+        ("map_batches", "validate_range_ownership"),
+        ("sort_partition", "build_group_boundaries", "map_group_partitions"),
+    ]
 
-
-def test_registered_custom_source_is_classified_without_read_fields():
-    source = _CustomLogicalSource()
-    grouped = _mgp(source, count=None)
-    source_requirements = GPUExecutionRequirements(
-        compatibility_key=GPUExecutionCompatibilityKey(
-            min_workers=2,
-            initial_workers=2,
-            max_workers=2,
-            num_cpus=1,
-            num_gpus=1,
-        )
+    specs = [node.gpu_operator_spec for node in nodes]
+    assert all(spec.requires_complete_fusion for spec in specs)
+    assert len({spec.fusion_group_id for spec in specs}) == 1
+    required_provenance = tuple(spec.logical_provenance[0] for spec in specs)
+    assert all(
+        spec.required_logical_provenance == required_provenance for spec in specs
     )
-    lowerers = create_default_gpu_lowerer_registry()
-    lowerers.register(
-        _CustomLogicalSource,
-        _CustomSourceLowerer(source_requirements),
+    assert [spec.owns_input_parallelism for spec in specs] == [True, False, False]
+    assert [spec.uses_terminal_output_adapter for spec in specs] == [
+        False,
+        False,
+        True,
+    ]
+    assert map_node.gpu_operator_spec.input_requirements == (
+        RangePartitioningRequired(("user",), "test-range-scheme"),
+        CompletePartitionBundles(),
     )
-    providers = GPUReadSourceProviderRegistry()
-    providers.register(_TestSourceProvider())
-
-    analysis = analyze_gpu_requirements(
-        grouped,
-        DataContext.get_current(),
-        lowerers=lowerers,
-        source_providers=providers,
-    )
-
-    component = analysis.components_by_anchor[grouped]
-    assert component.source is source
-    assert component.operators == (source, grouped)
-    assert component.execution_requirements == source_requirements
-    assert component.source_demand.source is source
-    assert component.mgp_requirements[0].partition_count == 4
+    assert mgp_node.gpu_operator_spec.output_properties == ()
+    assert planned.op_map[read_node] is read
+    assert planned.op_map[map_node] is mapped
+    assert planned.op_map[mgp_node] is grouped
+    assert provider.support_calls == 1
+    assert provider.lower_calls == 1
 
 
-def test_registered_custom_source_can_inherit_first_unary_profile():
-    source = _CustomLogicalSource()
-    mapped = _map(source, size=2)
-    grouped = _mgp(mapped, count=None)
-    lowerers = create_default_gpu_lowerer_registry()
-    lowerers.register(
-        _CustomLogicalSource,
-        _CustomSourceLowerer(None),
-    )
-    providers = GPUReadSourceProviderRegistry()
-    providers.register(_TestSourceProvider())
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _mgp(_read()),
+        lambda: _mgp(_map(_map(_read()))),
+        lambda: _mgp(_mgp(_map(_read()))),
+    ],
+    ids=("missing-map", "repeated-map", "repeated-mgp"),
+)
+def test_exact_v1_shape_rejects_missing_or_repeated_operators(build):
+    root = build()
+    planner, context = _planner(root)
 
-    analysis = analyze_gpu_requirements(
-        grouped,
-        DataContext.get_current(),
-        lowerers=lowerers,
-        source_providers=providers,
-    )
+    with pytest.raises(GPUPlanningError) as captured:
+        planner.try_plan(root, context)
 
-    component = analysis.components_by_anchor[grouped]
-    assert [
-        analysis.annotations[op]
-        .memberships[0]
-        .execution_requirements.compatibility_key.max_workers
-        for op in (source, mapped, grouped)
-    ] == [2, 2, 2]
-    assert component.source_demand.execution_requirements == (
-        analysis.annotations[mapped].memberships[0].execution_requirements
-    )
-    assert component.mgp_requirements[0].partition_count == 4
+    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+    assert "exactly Read -> one cuDF MapBatches" in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("mapped", "detail"),
+    [
+        (lambda read: _map(read, preserves=False), "preserves_partitioning"),
+        (lambda read: _map(read, batch_format="pyarrow"), "batch_format='cudf'"),
+    ],
+    ids=("not-preserving", "not-cudf"),
+)
+def test_exact_v1_rejects_an_ineligible_map(mapped, detail):
+    grouped = _mgp(mapped(_read()))
+    planner, context = _planner(grouped)
+
+    with pytest.raises(GPUPlanningError) as captured:
+        planner.try_plan(grouped, context)
+
+    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+    assert detail in str(captured.value)
+
+
+def test_exact_v1_rejects_a_shared_internal_map():
+    mapped = _map(_read())
+    left = _mgp(mapped)
+    right = _mgp(mapped)
+    root = Union([left, right])
+    planner, context = _planner(root)
+
+    with pytest.raises(GPUPlanningError) as captured:
+        planner.try_plan(left, context)
+
+    assert captured.value.reason is GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY
+    assert "shared by multiple logical consumers" in str(captured.value)
+
+
+def test_exact_v1_region_may_feed_one_stock_consumer():
+    grouped = _mgp(_map(_read()))
+    root = Limit(1, input_dependencies=[grouped])
+    planner, context = _planner(root)
+
+    planned = planner.try_plan(grouped, context)
+
+    assert planned is not None
+    assert len(_planned_nodes(planned.root)) == 3
+
+
+def test_non_mgp_operator_is_not_claimed():
+    mapped = _map(_read())
+    planner, context = _planner(mapped)
+
+    assert planner.try_plan(mapped, context) is None

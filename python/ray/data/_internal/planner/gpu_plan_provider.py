@@ -1,48 +1,43 @@
-"""Gate-2 construction for analyzed MGP-bearing GPU components."""
+"""Planning for the required-fusion Parquet/cuDF GPU pipeline.
+
+The planner deliberately supports one shape in V1::
+
+    Read -> MapBatches -> MapGroupPartitions
+
+It lowers each logical operator to an independent, non-executable physical
+operator.  It never composes specifications and never creates an execution
+backend.  The physical GPU fusion rule owns both of those operations.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Tuple
 
-from ray.data._internal.execution.gpu import (
-    GPUCompositionError,
-    GPUOperatorCreationOptions,
-    create_gpu_operator,
-)
-from ray.data._internal.execution.gpu.region_compiler import compile_gpu_region
+from ray.data._internal.execution.gpu.operator import PlannedGPUOperator
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
 from ray.data._internal.logical.interfaces import LogicalOperator
-from ray.data._internal.logical.operators import MapGroupPartitions
-from ray.data._internal.planner.gpu_lowering import (
-    GPUComponentRole,
-    GPULogicalLowererRegistry,
-    GPULoweringContext,
+from ray.data._internal.logical.operators import MapBatches, MapGroupPartitions, Read
+from ray.data._internal.planner.gpu_execution_profile import (
+    reconcile_read_remote_args,
 )
+from ray.data._internal.planner.gpu_lowering.interfaces import GPULoweringContext
+from ray.data._internal.planner.gpu_lowering.map_batches_lowerer import (
+    GPUMapBatchesLowerer,
+)
+from ray.data._internal.planner.gpu_lowering.map_group_partitions_lowerer import (
+    GPUMapGroupPartitionsLowerer,
+)
+from ray.data._internal.planner.gpu_lowering.parquet_read_lowerer import GPUReadLowerer
 from ray.data._internal.planner.gpu_planning_errors import (
     GPUPlanningError,
     GPUPlanningErrorReason,
 )
 from ray.data._internal.planner.gpu_read_source_provider import (
-    GPUReadSourceProviderRegistry,
-    create_default_gpu_source_provider_registry,
-)
-from ray.data._internal.planner.gpu_requirement_analysis import (
-    GPUComponentMembership,
-    GPUEdgeResolution,
-    GPUEdgeResolutionKind,
-    GPUEnforcerRegistry,
-    GPUPropertyTransferRegistry,
-    GPUPropertyState,
-    GPURequirementAnalysis,
-    GPURequirementResolver,
-    MGPGPUComponent,
-    MGPRequirement,
-    analyze_gpu_requirements,
-    create_default_gpu_enforcer_registry,
-    create_default_gpu_lowerer_registry,
-    create_default_property_transfer_registry,
+    GPUReadSourceDemand,
+    GPUReadSourceProvider,
+    ParquetRangeGPUReadProvider,
 )
 from ray.data.context import DataContext
 
@@ -53,56 +48,45 @@ class GPUPlannedStage:
     op_map: Mapping[PhysicalOperator, LogicalOperator]
 
 
-def create_gpu_gate2_planner(
+def create_gpu_required_fusion_planner(
     root: LogicalOperator,
     data_context: DataContext,
     *,
-    lowerers: Optional[GPULogicalLowererRegistry] = None,
-    source_providers: Optional[GPUReadSourceProviderRegistry] = None,
-    property_transfers: Optional[GPUPropertyTransferRegistry] = None,
-    enforcers: Optional[GPUEnforcerRegistry] = None,
-) -> "GPUGate2Planner":
-    if lowerers is None:
-        lowerers = create_default_gpu_lowerer_registry()
-    if source_providers is None:
-        source_providers = create_default_gpu_source_provider_registry()
-    if property_transfers is None:
-        property_transfers = create_default_property_transfer_registry()
-    else:
-        property_transfers = property_transfers.copy()
-    if enforcers is None:
-        enforcers = create_default_gpu_enforcer_registry()
-    analysis = analyze_gpu_requirements(
+    source_provider: Optional[GPUReadSourceProvider] = None,
+) -> "GPURequiredFusionPlanner":
+    """Create a plan-local exact-shape GPU planner.
+
+    ``data_context`` is accepted to preserve the existing planner hook.  No
+    footer reads, range planning, spec composition, or backend construction
+    occurs until :meth:`GPURequiredFusionPlanner.try_plan` sees an MGP anchor.
+    """
+
+    del data_context
+    return GPURequiredFusionPlanner(
         root,
-        data_context,
-        lowerers=lowerers,
-        source_providers=source_providers,
-        property_transfers=property_transfers,
-        enforcers=enforcers,
-    )
-    return GPUGate2Planner(
-        analysis,
-        lowerers=lowerers,
-        property_transfers=property_transfers,
-        resolver=GPURequirementResolver(enforcers),
+        source_provider=source_provider or ParquetRangeGPUReadProvider(),
     )
 
 
-class GPUGate2Planner:
-    """Lower, resolve, and compose one already-analyzed component at a time."""
+class GPURequiredFusionPlanner:
+    """Lower exactly one Read/MapBatches/MGP component to deferred GPU nodes."""
 
     def __init__(
         self,
-        analysis: GPURequirementAnalysis,
+        root: LogicalOperator,
         *,
-        lowerers: GPULogicalLowererRegistry,
-        property_transfers: GPUPropertyTransferRegistry,
-        resolver: GPURequirementResolver,
+        source_provider: GPUReadSourceProvider,
     ) -> None:
-        self.analysis = analysis
-        self._lowerers = lowerers
-        self._property_transfers = property_transfers
-        self._resolver = resolver
+        operators = tuple(_post_order_logical(root))
+        self._consumer_counts = _logical_consumer_counts(operators)
+        self._logical_node_ids = {
+            op: f"logical-{ordinal:04d}-{type(op).__name__}"
+            for ordinal, op in enumerate(operators)
+        }
+        self._source_provider = source_provider
+        self._read_lowerer = GPUReadLowerer()
+        self._map_lowerer = GPUMapBatchesLowerer()
+        self._mgp_lowerer = GPUMapGroupPartitionsLowerer()
 
     def try_plan(
         self,
@@ -111,353 +95,245 @@ class GPUGate2Planner:
     ) -> Optional[GPUPlannedStage]:
         if type(logical_op) is not MapGroupPartitions:
             return None
-        component = self.analysis.components_by_anchor.get(logical_op)
-        if component is None:
-            # A non-anchor MGP is consumed by a larger maximal component.  It
-            # should never be reached recursively unless the analyzed DAG and
-            # planner traversal disagree.
-            return None
-        return self._plan_component(component, data_context)
+        return self._plan_exact_component(logical_op, data_context)
 
-    def _plan_component(
+    def _plan_exact_component(
         self,
-        component: MGPGPUComponent,
+        anchor: MapGroupPartitions,
         data_context: DataContext,
     ) -> GPUPlannedStage:
+        if data_context.checkpoint_config is not None:
+            _unsupported(anchor, "checkpointing is not supported")
+
+        read_op, map_op = self._discover_exact_shape(anchor)
+        read_analysis = self._read_lowerer.analyze(read_op, data_context)
+        map_analysis = self._map_lowerer.analyze(map_op, data_context)
+        mgp_analysis = self._mgp_lowerer.analyze(anchor, data_context)
+        for op, analysis in (
+            (read_op, read_analysis),
+            (map_op, map_analysis),
+            (anchor, mgp_analysis),
+        ):
+            if not analysis.accepted:
+                _unsupported(
+                    anchor,
+                    f"operator={_op_label(op)}; capability={analysis.reason}",
+                )
+
+        if not map_analysis.preserves_partitioning:
+            _unsupported(
+                anchor,
+                "the cuDF MapBatches UDF must declare "
+                "UDFProperties(preserves_partitioning=True)",
+            )
+        requirements = map_analysis.execution_requirements
+        if requirements is None:
+            raise AssertionError("GPU MapBatches analysis must declare execution")
+        requirements = reconcile_read_remote_args(
+            requirements,
+            read_op.ray_remote_args,
+            consumer=_op_label(anchor),
+        )
+
+        group_keys = mgp_analysis.partition_keys
+        target_ranges = (
+            2 * requirements.compatibility_key.max_workers
+            if mgp_analysis.requested_partitions is None
+            else mgp_analysis.requested_partitions
+        )
+        assert target_ranges is not None
+        demand = GPUReadSourceDemand(
+            group_keys=group_keys,
+            target_ranges=target_ranges,
+            num_workers=requirements.compatibility_key.max_workers,
+        )
+        support = self._source_provider.supports(read_op, demand)
+        if not support.accepted:
+            _unsupported(
+                anchor,
+                "the Read is not supported by the required Parquet range source "
+                f"({support.reason})",
+            )
+
         target_bytes = data_context.target_max_block_size
         if (
             not isinstance(target_bytes, int)
             or isinstance(target_bytes, bool)
             or target_bytes <= 0
         ):
-            raise GPUPlanningError(
-                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                f"consumer={component.anchor.name}; "
-                "DataContext.target_max_block_size must be positive",
-            )
-        demand = component.source_demand
-        first_group_keys = component.mgp_requirements[0].keys
+            _unsupported(anchor, "DataContext.target_max_block_size must be positive")
+
+        logical_ops: Tuple[LogicalOperator, ...] = (read_op, map_op, anchor)
+        provenance = tuple(self._logical_node_ids[op] for op in logical_ops)
+        fusion_group_id = f"gpu-required:{provenance[0]}->{provenance[-1]}"
         context = GPULoweringContext(
-            stage_id=component.component_id,
-            logical_node_id=self.analysis.logical_node_ids[component.source],
-            group_keys=first_group_keys,
-            source_provider=demand.provider,
-            execution_requirements=component.execution_requirements,
+            stage_id=fusion_group_id,
+            logical_node_id=provenance[0],
+            group_keys=group_keys,
+            source_provider=self._source_provider,
+            execution_requirements=requirements,
             target_max_block_size=int(target_bytes),
             retried_io_errors=tuple(data_context.retried_io_errors),
-            target_ranges=demand.partition_count,
-            num_workers=(
-                component.execution_requirements.compatibility_key.max_workers
-            ),
+            target_ranges=target_ranges,
+            num_workers=requirements.compatibility_key.max_workers,
         )
 
-        op_map: Dict[PhysicalOperator, LogicalOperator] = {}
-        physical_input: Optional[PhysicalOperator] = None
-        pending_specs = []
-        pending_options = []
-        pending_logical_ops = []
-        pending_input: Optional[PhysicalOperator] = None
-        previous_annotated_profile = None
-        concrete_state: Optional[GPUPropertyState] = None
+        read_lowered = self._read_lowerer.lower(read_op, context)
+        read_spec = _bind_required_region(
+            read_lowered.spec,
+            fusion_group_id=fusion_group_id,
+            required_provenance=provenance,
+            owns_input_parallelism=True,
+        )
+        map_context = read_lowered.downstream_context.for_operator(
+            logical_node_id=provenance[1],
+        )
+        map_lowered = self._map_lowerer.lower(map_op, map_context)
+        map_spec = _bind_required_region(
+            map_lowered.spec,
+            fusion_group_id=fusion_group_id,
+            required_provenance=provenance,
+        )
+        mgp_context = map_lowered.downstream_context.for_operator(
+            logical_node_id=provenance[2],
+            group_keys=group_keys,
+        )
+        mgp_lowered = self._mgp_lowerer.lower(anchor, mgp_context)
+        mgp_spec = _bind_required_region(
+            mgp_lowered.spec,
+            fusion_group_id=fusion_group_id,
+            required_provenance=provenance,
+            uses_terminal_output_adapter=True,
+        )
 
-        def finalize_pending(*, terminal: bool) -> PhysicalOperator:
-            nonlocal pending_specs, pending_options, pending_logical_ops, pending_input
-            if not pending_specs or pending_input is None:
-                raise AssertionError("cannot finalize an empty GPU stage")
-            try:
-                compiled = compile_gpu_region(pending_specs).for_gate2_stage(
-                    specialized_read_parallelism_resolved=any(
-                        self._lowerers.role_for(op) is GPUComponentRole.SOURCE
-                        for op in pending_logical_ops
-                    ),
-                    uses_terminal_output_adapter=terminal,
-                )
-            except GPUPlanningError:
-                raise
-            except ValueError as error:
-                raise GPUPlanningError(
-                    GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                    f"consumer={component.anchor.name}; gate-2 final GPU "
-                    f"stage composition refused: {error}",
-                ) from error
+        artifacts = read_lowered.source_artifacts
+        if artifacts is None:
+            _unsupported(anchor, "GPU Read lowering returned no source work")
+        source_input = InputDataBuffer(
+            data_context,
+            input_data_factory=artifacts.input_data_factory,
+        )
+        read_node = PlannedGPUOperator(
+            read_spec,
+            source_input,
+            data_context,
+            read_lowered.creation_options,
+        )
+        map_node = PlannedGPUOperator(
+            map_spec,
+            read_node,
+            data_context,
+            map_lowered.creation_options,
+        )
+        mgp_node = PlannedGPUOperator(
+            mgp_spec,
+            map_node,
+            data_context,
+            mgp_lowered.creation_options,
+        )
 
-            try:
-                options = _composed_creation_options(pending_options, compiled)
-                physical = create_gpu_operator(
-                    compiled,
-                    pending_input,
-                    data_context,
-                    options,
-                )
-            except GPUPlanningError:
-                raise
-            except ValueError as error:
-                raise GPUPlanningError(
-                    GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                    f"consumer={component.anchor.name}; gate-2 GPU operator "
-                    f"factory or boundary adapter refused the compiled stage: {error}",
-                ) from error
-            physical.set_logical_operators(*pending_logical_ops)
-            op_map[physical] = pending_logical_ops[-1]
-            pending_specs = []
-            pending_options = []
-            pending_logical_ops = []
-            pending_input = None
-            return physical
+        source_input.set_logical_operators(read_op)
+        for physical, logical in (
+            (read_node, read_op),
+            (map_node, map_op),
+            (mgp_node, anchor),
+        ):
+            physical.set_logical_operators(logical)
+        return GPUPlannedStage(
+            root=mgp_node,
+            op_map={
+                source_input: read_op,
+                read_node: read_op,
+                map_node: map_op,
+                mgp_node: anchor,
+            },
+        )
 
-        for ordinal, op in enumerate(component.operators):
-            membership = _membership_for(self.analysis, op, component.component_id)
-            group_keys = _group_keys_for(component, ordinal)
-            profile_changed = (
-                previous_annotated_profile is not None
-                and membership.execution_requirements != previous_annotated_profile
-            )
-            if profile_changed and (
-                membership.input_resolution.kind is not GPUEdgeResolutionKind.ENFORCER
-            ):
-                raise AssertionError(
-                    "an analyzed execution-profile boundary requires an enforcer"
-                )
-
-            if membership.input_resolution.kind is GPUEdgeResolutionKind.ENFORCER:
-                upstream = finalize_pending(terminal=False)
-                physical_input, enforced_state = _apply_enforcer(
-                    membership.input_resolution,
-                    upstream,
-                    data_context,
-                    op_map,
-                    self._resolver,
-                )
-                context = replace(
-                    context,
-                    input_properties=enforced_state.facts,
-                    execution_requirements=membership.execution_requirements,
-                )
-                concrete_state = enforced_state
-
-            op_context = context.for_operator(
-                logical_node_id=self.analysis.logical_node_ids[op],
-                group_keys=group_keys,
-            )
-            role = self._lowerers.role_for(op)
-            operator_input_state = concrete_state
-            if role is GPUComponentRole.SOURCE:
-                lowered = self._lowerers.lower(op, op_context)
-                operator_output_state = GPUPropertyState(
-                    facts=lowered.spec.output_properties,
-                    partition_count=demand.partition_count,
-                )
-            else:
-                if operator_input_state is None:
-                    raise AssertionError(
-                        "a non-source GPU operator requires a concrete input state"
-                    )
-                lowered, operator_output_state = self._lower_with_property_validation(
-                    op,
-                    op_context,
-                    operator_input_state,
-                    component,
-                )
-
-            if role is GPUComponentRole.SOURCE:
-                artifacts = lowered.source_artifacts
-                if artifacts is None:
-                    raise GPUPlanningError(
-                        GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                        f"consumer={component.anchor.name}; GPU Read lowerer "
-                        "returned no concrete source work",
-                    )
-                source_input = InputDataBuffer(
-                    data_context,
-                    input_data_factory=artifacts.input_data_factory,
-                )
-                source_input.set_logical_operators(op)
-                op_map[source_input] = op
-                physical_input = source_input
-
-            if physical_input is None:
-                raise AssertionError("GPU component has no physical input")
-            if pending_input is None:
-                pending_input = physical_input
-
-            if pending_specs:
-                try:
-                    # Use the exact pure compiler shared with physical fusion.
-                    compile_gpu_region(
-                        (*pending_specs, lowered.spec),
-                        require_resolved_output=False,
-                    )
-                except GPUCompositionError as error:
-                    required = _next_partition_requirement(component, ordinal)
-                    resolution = self._resolver.require_same_stage(
-                        consumer=op,
-                        required_keys=required.keys,
-                        required_partition_count=required.partition_count,
-                        available=operator_input_state,
-                        upstream_execution_requirements=(
-                            pending_specs[-1].execution_requirements
-                        ),
-                        downstream_execution_requirements=(
-                            membership.execution_requirements
-                        ),
-                        detail=f"same-stage composition refused: {error}",
-                    )
-                    upstream = finalize_pending(terminal=False)
-                    physical_input, enforced_state = _apply_enforcer(
-                        resolution,
-                        upstream,
-                        data_context,
-                        op_map,
-                        self._resolver,
-                    )
-                    context = replace(
-                        context,
-                        input_properties=enforced_state.facts,
-                        execution_requirements=membership.execution_requirements,
-                    )
-                    concrete_state = enforced_state
-                    operator_input_state = enforced_state
-                    op_context = context.for_operator(
-                        logical_node_id=self.analysis.logical_node_ids[op],
-                        group_keys=group_keys,
-                    )
-                    lowered, operator_output_state = (
-                        self._lower_with_property_validation(
-                            op,
-                            op_context,
-                            operator_input_state,
-                            component,
-                        )
-                    )
-                    pending_input = physical_input
-
-            pending_specs.append(lowered.spec)
-            pending_options.append(lowered.creation_options)
-            pending_logical_ops.append(op)
-            context = lowered.downstream_context
-            concrete_state = operator_output_state
-            previous_annotated_profile = membership.execution_requirements
-
-        root = finalize_pending(terminal=True)
-        return GPUPlannedStage(root=root, op_map=op_map)
-
-    def _lower_with_property_validation(
+    def _discover_exact_shape(
         self,
-        logical_op: LogicalOperator,
-        context: GPULoweringContext,
-        input_state: GPUPropertyState,
-        component: MGPGPUComponent,
-    ):
-        """Lower one non-source op and verify its concrete property contract."""
-
-        lowered = self._lowerers.lower(logical_op, context)
-        try:
-            expected_state = self._property_transfers.transfer(
-                logical_op,
-                input_state,
+        anchor: MapGroupPartitions,
+    ) -> Tuple[Read, MapBatches]:
+        if len(anchor.input_dependencies) != 1:
+            _unsupported(anchor, "MapGroupPartitions must have exactly one input")
+        map_op = anchor.input_dependencies[0]
+        if type(map_op) is not MapBatches or len(map_op.input_dependencies) != 1:
+            _unsupported(
+                anchor,
+                "V1 requires exactly Read -> one cuDF MapBatches -> "
+                "MapGroupPartitions",
             )
-            if not isinstance(expected_state, GPUPropertyState):
-                raise TypeError(
-                    "registered GPU property transfer must return GPUPropertyState"
+        read_op = map_op.input_dependencies[0]
+        if type(read_op) is not Read:
+            _unsupported(
+                anchor,
+                "V1 requires exactly Read -> one cuDF MapBatches -> "
+                "MapGroupPartitions",
+            )
+        for op in (read_op, map_op):
+            if self._consumer_counts.get(op, 0) != 1:
+                _unsupported(
+                    anchor,
+                    f"{_op_label(op)} is shared by multiple logical consumers",
                 )
-        except GPUPlanningError:
-            raise
-        except Exception as error:
-            raise GPUPlanningError(
-                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                f"consumer={component.anchor.name}; registered property transfer "
-                f"failed for {type(logical_op).__name__}({logical_op.name}): "
-                f"{error}",
-            ) from error
-
-        actual_facts = lowered.spec.output_properties
-        if actual_facts != expected_state.facts:
-            raise GPUPlanningError(
-                GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
-                f"consumer={component.anchor.name}; GPU lowerer and registered "
-                f"property transfer disagree for "
-                f"{type(logical_op).__name__}({logical_op.name}); "
-                f"expected_output_facts={expected_state.facts!r}; "
-                f"actual_output_facts={actual_facts!r}",
-            )
-        return lowered, expected_state
+        if self._consumer_counts.get(anchor, 0) > 1:
+            _unsupported(anchor, "MapGroupPartitions is shared by multiple consumers")
+        return read_op, map_op
 
 
-def _membership_for(
-    analysis: GPURequirementAnalysis,
-    op: LogicalOperator,
-    component_id: str,
-) -> GPUComponentMembership:
-    return next(
-        membership
-        for membership in analysis.annotations[op].memberships
-        if membership.component_id == component_id
-    )
-
-
-def _group_keys_for(
-    component: MGPGPUComponent,
-    ordinal: int,
-) -> Tuple[str, ...]:
-    remaining = set(component.operators[ordinal:])
-    for requirement in component.mgp_requirements:
-        if requirement.operator in remaining:
-            return requirement.keys
-    return component.mgp_requirements[-1].keys
-
-
-def _next_partition_requirement(
-    component: MGPGPUComponent,
-    ordinal: int,
-) -> MGPRequirement:
-    remaining = set(component.operators[ordinal:])
-    return next(
-        requirement
-        for requirement in component.mgp_requirements
-        if requirement.operator in remaining
-    )
-
-
-def _apply_enforcer(
-    resolution: GPUEdgeResolution,
-    upstream: PhysicalOperator,
-    data_context: DataContext,
-    op_map: Dict[PhysicalOperator, LogicalOperator],
-    resolver: GPURequirementResolver,
-):
-    if (
-        resolution.kind is not GPUEdgeResolutionKind.ENFORCER
-        or resolution.enforcer is None
-        or resolution.request is None
-    ):
-        raise AssertionError("an unsatisfied edge requires a selected enforcer")
-    plan = resolution.enforcer.plan(
-        resolution.request,
-        upstream=upstream,
-        data_context=data_context,
-    )
-    resolver.validate_enforcer_state(resolution.request, plan.output_state)
-    if plan.output_state != resolution.established_state:
-        raise GPUPlanningError(
-            GPUPlanningErrorReason.EXCHANGE_REQUIRED,
-            "selected GPU enforcer materialized a property state different "
-            "from its analyzed contract",
-        )
-    op_map.update(plan.op_map)
-    return plan.physical_input, plan.output_state
-
-
-def _composed_creation_options(
-    options: list[GPUOperatorCreationOptions],
+def _bind_required_region(
     spec,
-) -> GPUOperatorCreationOptions:
-    result = options[0]
-    for downstream in options[1:]:
-        result = result.for_fused_spec(downstream, spec)
-    return result
+    *,
+    fusion_group_id: str,
+    required_provenance: Tuple[str, ...],
+    owns_input_parallelism: bool = False,
+    uses_terminal_output_adapter: bool = False,
+):
+    return replace(
+        spec,
+        fusion_group_id=fusion_group_id,
+        required_logical_provenance=required_provenance,
+        requires_complete_fusion=True,
+        owns_input_parallelism=owns_input_parallelism,
+        uses_terminal_output_adapter=uses_terminal_output_adapter,
+    )
 
 
-def raise_mgp_without_gpu_gate2(
+def _post_order_logical(root: LogicalOperator) -> Iterable[LogicalOperator]:
+    visited: set[LogicalOperator] = set()
+
+    def visit(op: LogicalOperator):
+        if op in visited:
+            return
+        visited.add(op)
+        for child in op.input_dependencies:
+            yield from visit(child)
+        yield op
+
+    yield from visit(root)
+
+
+def _logical_consumer_counts(
+    operators: Tuple[LogicalOperator, ...],
+) -> Dict[LogicalOperator, int]:
+    counts = {op: 0 for op in operators}
+    for op in operators:
+        for child in op.input_dependencies:
+            counts[child] += 1
+    return counts
+
+
+def _unsupported(anchor: MapGroupPartitions, detail: str) -> None:
+    raise GPUPlanningError(
+        GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
+        f"consumer={_op_label(anchor)}; {detail}",
+    )
+
+
+def _op_label(op: LogicalOperator) -> str:
+    return f"{type(op).__name__}({op.name})"
+
+
+def raise_mgp_without_required_gpu_fusion(
     logical_op: MapGroupPartitions,
     *,
     gpu_enabled: bool,
@@ -466,8 +342,8 @@ def raise_mgp_without_gpu_gate2(
         "MapGroupPartitions has no CPU/stock fallback and requires "
         "DataContext.enable_gpu_operator_fusion=True"
         if not gpu_enabled
-        else "MapGroupPartitions was not claimed by an analyzed maximal GPU "
-        "component and has no CPU/stock fallback"
+        else "MapGroupPartitions was not claimed by the exact required-fusion "
+        "GPU planner and has no CPU/stock fallback"
     )
     raise GPUPlanningError(
         GPUPlanningErrorReason.UNSUPPORTED_CAPABILITY,
@@ -476,10 +352,10 @@ def raise_mgp_without_gpu_gate2(
 
 
 __all__ = [
-    "GPUGate2Planner",
+    "GPURequiredFusionPlanner",
     "GPUPlannedStage",
     "GPUPlanningError",
     "GPUPlanningErrorReason",
-    "create_gpu_gate2_planner",
-    "raise_mgp_without_gpu_gate2",
+    "create_gpu_required_fusion_planner",
+    "raise_mgp_without_required_gpu_fusion",
 ]

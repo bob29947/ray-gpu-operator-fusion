@@ -1,28 +1,30 @@
-from dataclasses import dataclass
+"""Focused contracts for the three concrete V1 GPU lowerers."""
+
 from types import SimpleNamespace
+
+import pytest
 
 from ray.data import ActorPoolStrategy, UDFProperties
 from ray.data._internal.execution.gpu import (
     CompletePartitionBundles,
     Evidence,
+    GPUCompositionError,
+    GPUCompositionErrorReason,
     GPUExecutionCompatibilityKey,
     GPUExecutionRequirements,
     GPUOperatorCreationOptions,
     GPUOperatorSpec,
     GPUTransformSpec,
     KeysColocated,
-    PartitioningProperty,
-    PartitioningValidation,
     PayloadKind,
     PropertyFact,
+    RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+    RANGE_DATA_TERMINAL_ADAPTER_KEY,
+    RANGE_WORK_ADAPTER_KEY,
     RangePartitioning,
-    UnknownPartitioning,
-    ValidationObligation,
-    compile_gpu_region,
-    register_partitioning_preservation,
-    register_property_satisfaction,
-    unregister_partitioning_preservation,
-    unregister_property_satisfaction,
+    RangePartitioningRequired,
+    RowsOwnedByRange,
+    compose_gpu_operator_specs,
 )
 from ray.data._internal.logical.operators import (
     MapBatches,
@@ -41,10 +43,7 @@ from ray.data._internal.planner.gpu_read_source_provider import (
     GPUReadSourceArtifacts,
     GPUReadSourceLowering,
 )
-from ray.data._internal.planner.gpu_requirement_analysis import (
-    GPUPropertyState,
-    create_default_property_transfer_registry,
-)
+from ray.data.context import DataContext
 from ray.data.datasource.datasource import Datasource
 
 
@@ -55,35 +54,6 @@ class _Source(Datasource):
 class _GPUMap:
     def __call__(self, batch):
         return batch
-
-
-@dataclass(frozen=True)
-class _HashPartitioning(PartitioningProperty):
-    keys: tuple[str, ...]
-    scheme_id: str
-
-
-@dataclass(frozen=True)
-class _RowsOwnedByHash(ValidationObligation):
-    scheme_id: str
-
-
-def _hash_partitioning_validations(value):
-    assert isinstance(value, _HashPartitioning)
-    obligation = _RowsOwnedByHash(value.scheme_id)
-    return (
-        PartitioningValidation(
-            kind="validate_hash_ownership",
-            config=(value.keys, value.scheme_id),
-            obligations=(obligation,),
-        ),
-    )
-
-
-def _hash_satisfies_colocation(value, requirement):
-    assert isinstance(value, _HashPartitioning)
-    assert isinstance(requirement, KeysColocated)
-    return requirement.keys[: len(value.keys)] == value.keys
 
 
 def _partition_fn(frame, context):
@@ -100,12 +70,12 @@ def _read():
     )
 
 
-def _map(parent, *, preserves):
+def _map(parent, *, preserves=True, batch_format="cudf"):
     return MapBatches(
         fn=_GPUMap,
         input_dependencies=[parent],
         batch_size=8,
-        batch_format="cudf",
+        batch_format=batch_format,
         compute=ActorPoolStrategy(size=1),
         ray_remote_args={"num_cpus": 1, "num_gpus": 1},
         udf_properties=(
@@ -114,42 +84,54 @@ def _map(parent, *, preserves):
     )
 
 
-def _mgp(parent, *, preserves):
+def _mgp(parent):
     return MapGroupPartitions(
         key=["user", "card"],
         num_partitions=2,
         fn=_partition_fn,
-        udf_properties=(
-            UDFProperties(preserves_partitioning=True) if preserves else None
-        ),
         input_dependencies=[parent],
     )
 
 
 def _artifacts():
-    work = ("range-0", "range-1")
     return GPUReadSourceArtifacts(
         input_data_factory=lambda _target_size: [],
-        provider_artifacts=SimpleNamespace(work=work),
+        provider_artifacts=SimpleNamespace(work=("range-0", "range-1")),
+    )
+
+
+def _requirements():
+    return GPUExecutionRequirements(
+        compatibility_key=GPUExecutionCompatibilityKey(num_gpus=0)
+    )
+
+
+def _range_properties(*, scheme_id="range-scheme"):
+    return (
+        PropertyFact(
+            RangePartitioning(("user",), scheme_id),
+            Evidence.OPERATOR_GUARANTEE,
+        ),
+        PropertyFact(
+            CompletePartitionBundles(),
+            Evidence.OPERATOR_GUARANTEE,
+        ),
     )
 
 
 def _context(
     *,
     logical_node_id,
-    group_keys=("user", "card"),
     input_properties=(),
     source_artifacts=None,
     source_provider=None,
 ):
     return GPULoweringContext(
-        stage_id="stage-1",
+        stage_id="required-v1-stage",
         logical_node_id=logical_node_id,
-        group_keys=group_keys,
+        group_keys=("user", "card"),
         source_provider=source_provider or object(),
-        execution_requirements=GPUExecutionRequirements(
-            compatibility_key=GPUExecutionCompatibilityKey(num_gpus=0)
-        ),
+        execution_requirements=_requirements(),
         target_max_block_size=1024,
         retried_io_errors=("network",),
         target_ranges=2,
@@ -159,46 +141,61 @@ def _context(
     )
 
 
-def _range_properties():
-    return (
-        PropertyFact(
-            RangePartitioning(("user",), "range-scheme"),
-            Evidence.OPERATOR_GUARANTEE,
-        ),
-        PropertyFact(
-            CompletePartitionBundles(),
-            Evidence.OPERATOR_GUARANTEE,
-        ),
-    )
-
-
-def test_read_lowerer_is_source_provider_dispatch_not_parquet_logic():
-    artifacts = _artifacts()
-    requirements = GPUExecutionRequirements(
-        compatibility_key=GPUExecutionCompatibilityKey(num_gpus=0)
-    )
-    spec = GPUOperatorSpec(
-        spec_instance_id="source-node",
+def _read_spec(*, scheme_id="range-scheme"):
+    return GPUOperatorSpec(
+        spec_instance_id="read-node",
         transforms=(
             GPUTransformSpec(
-                "source-node/0/custom_source",
-                "custom_source",
-                PayloadKind.RANGE_WORK,
-                PayloadKind.RANGE_DATA,
+                transform_id="read-node/0/read_parquet_range",
+                kind="read_parquet_range",
+                input_payload=PayloadKind.RANGE_WORK,
+                output_payload=PayloadKind.RANGE_DATA,
             ),
         ),
         external_input_payload=PayloadKind.RAY_BLOCK_STREAM,
         external_output_payload=PayloadKind.RAY_BLOCK_STREAM,
         native_input_payload=PayloadKind.RANGE_WORK,
         native_output_payload=PayloadKind.RANGE_DATA,
-        input_adapter_key="custom-source-import-v1",
-        output_adapter_key="custom-source-export-v1",
-        terminal_output_adapter_key="custom-source-terminal-v1",
-        execution_requirements=requirements,
-        output_properties=_range_properties(),
+        input_adapter_key=RANGE_WORK_ADAPTER_KEY,
+        output_adapter_key=RANGE_DATA_BOUNDARY_ADAPTER_KEY,
+        terminal_output_adapter_key=RANGE_DATA_TERMINAL_ADAPTER_KEY,
+        execution_requirements=_requirements(),
+        output_properties=_range_properties(scheme_id=scheme_id),
+        logical_provenance=("read-node",),
     )
 
-    class _Provider:
+
+def test_concrete_lowerer_analysis_describes_the_exact_v1_capabilities():
+    read = _read()
+    preserving_map = _map(read)
+    grouped = _mgp(preserving_map)
+    context = DataContext.get_current()
+
+    map_analysis = GPUMapBatchesLowerer().analyze(preserving_map, context)
+    mgp_analysis = GPUMapGroupPartitionsLowerer().analyze(grouped, context)
+
+    assert map_analysis.accepted
+    assert map_analysis.preserves_partitioning
+    assert map_analysis.execution_requirements is not None
+    assert mgp_analysis.accepted
+    assert mgp_analysis.partition_keys == ("user", "card")
+    assert mgp_analysis.requested_partitions == 2
+
+    nonpreserving = GPUMapBatchesLowerer().analyze(
+        _map(read, preserves=False), context
+    )
+    non_cudf = GPUMapBatchesLowerer().analyze(
+        _map(read, batch_format="pyarrow"), context
+    )
+    assert nonpreserving.accepted and not nonpreserving.preserves_partitioning
+    assert not non_cudf.accepted
+
+
+def test_read_lowerer_uses_one_plan_local_source_without_a_registry():
+    artifacts = _artifacts()
+    spec = _read_spec()
+
+    class _PlanLocalSource:
         def __init__(self):
             self.request = None
 
@@ -206,231 +203,138 @@ def test_read_lowerer_is_source_provider_dispatch_not_parquet_logic():
             assert type(logical_op) is Read
             self.request = request
             return GPUReadSourceLowering(
-                spec,
-                GPUOperatorCreationOptions(name="CustomGPURead"),
-                artifacts,
+                spec=spec,
+                creation_options=GPUOperatorCreationOptions(name="GPURead"),
+                artifacts=artifacts,
             )
 
-    provider = _Provider()
-    context = _context(
-        logical_node_id="source-node",
-        group_keys=("user",),
-        source_provider=provider,
+    source = _PlanLocalSource()
+    lowered = GPUReadLowerer().lower(
+        _read(),
+        _context(logical_node_id="read-node", source_provider=source),
     )
-    lowered = GPUReadLowerer().lower(_read(), context)
 
     assert lowered.spec is spec
-    assert lowered.creation_options.name == "CustomGPURead"
     assert lowered.source_artifacts is artifacts
     assert lowered.downstream_context.source_artifacts is artifacts
     assert lowered.downstream_context.input_properties == spec.output_properties
-    assert provider.request.logical_node_id == "source-node"
+    assert source.request.logical_node_id == "read-node"
+    assert source.request.group_keys == ("user", "card")
 
 
-def test_preserving_map_has_stable_ids_and_explicitly_readvertises_facts():
-    read = _read()
-    logical = _map(read, preserves=True)
-    context = _context(
-        logical_node_id="map-node-7",
-        input_properties=_range_properties(),
-        source_artifacts=_artifacts(),
-    )
-
-    lowered = GPUMapBatchesLowerer().lower(logical, context)
-
-    assert lowered.spec.transform_ids == (
-        "map-node-7/0/map_batches",
-        "map-node-7/1/validate_range_ownership",
-    )
-    assert lowered.spec.output_properties == lowered.downstream_context.input_properties
-    assert isinstance(lowered.spec.output_properties[0].value, RangePartitioning)
-    assert isinstance(lowered.spec.output_properties[1].value, CompletePartitionBundles)
-    assert lowered.spec.external_input_payload is PayloadKind.RAY_BLOCK_STREAM
-    assert lowered.spec.external_output_payload is PayloadKind.RAY_BLOCK_STREAM
-    assert lowered.spec.native_input_payload is PayloadKind.RANGE_DATA
-    assert lowered.spec.native_output_payload is PayloadKind.RANGE_DATA
-
-
-def test_partitioning_invalidation_cannot_be_recreated_by_later_preservation():
-    read = _read()
-    artifacts = _artifacts()
-    invalidating_op = _map(read, preserves=False)
-    invalidating = GPUMapBatchesLowerer().lower(
-        invalidating_op,
-        _context(
-            logical_node_id="map-invalidates",
-            input_properties=_range_properties(),
-            source_artifacts=artifacts,
-        ),
-    )
-    analyzed = create_default_property_transfer_registry().transfer(
-        invalidating_op,
-        GPUPropertyState(_range_properties(), partition_count=2),
-    )
-    assert invalidating.spec.output_properties == analyzed.facts
-    assert isinstance(
-        invalidating.spec.output_properties[1].value,
-        CompletePartitionBundles,
-    )
-    preserving_context = invalidating.downstream_context.for_operator(
-        logical_node_id="map-cannot-recreate"
-    )
-    later = GPUMapBatchesLowerer().lower(
-        _map(read, preserves=True),
-        preserving_context,
-    )
-
-    assert later.spec.transform_ids == ("map-cannot-recreate/0/map_batches",)
-    assert len(later.spec.output_properties) == 2
-    assert isinstance(later.spec.output_properties[0].value, UnknownPartitioning)
-    assert isinstance(
-        later.spec.output_properties[1].value,
-        CompletePartitionBundles,
-    )
-
-
-def test_mgp_is_native_producer_and_preservation_validates_only_range_key():
-    read = _read()
-    logical = _mgp(read, preserves=True)
-    context = _context(
-        logical_node_id="mgp-node-3",
-        input_properties=_range_properties(),
-        source_artifacts=_artifacts(),
-    )
-
-    lowered = GPUMapGroupPartitionsLowerer().lower(logical, context)
-
-    assert lowered.spec.transform_ids == (
-        "mgp-node-3/0/sort_partition",
-        "mgp-node-3/1/build_group_boundaries",
-        "mgp-node-3/2/map_group_partitions",
-        "mgp-node-3/3/validate_range_ownership",
-    )
-    assert lowered.spec.native_output_payload is PayloadKind.RANGE_DATA
-    assert lowered.spec.external_output_payload is PayloadKind.RAY_BLOCK_STREAM
-    assert lowered.spec.input_requirements == (
-        KeysColocated(("user", "card")),
-        CompletePartitionBundles(),
-    )
-    validation_config = lowered.spec.transforms[-1].config
-    assert validation_config.range_key == "user"
-    assert validation_config.group_keys == ("user",)
-    assert isinstance(lowered.spec.output_properties[0].value, RangePartitioning)
-    assert isinstance(lowered.spec.output_properties[1].value, CompletePartitionBundles)
-
-
-def test_lowered_map_and_mgp_compile_with_same_structural_contract():
-    read = _read()
-    artifacts = _artifacts()
-    mapped = GPUMapBatchesLowerer().lower(
-        _map(read, preserves=True),
+def test_preserving_map_spec_requires_and_readvertises_the_exact_range_scheme():
+    logical = _map(_read())
+    lowered = GPUMapBatchesLowerer().lower(
+        logical,
         _context(
             logical_node_id="map-node",
             input_properties=_range_properties(),
+            source_artifacts=_artifacts(),
+        ),
+    )
+
+    spec = lowered.spec
+    assert spec.transform_ids == (
+        "map-node/0/map_batches",
+        "map-node/1/validate_range_ownership",
+    )
+    assert spec.input_requirements == (
+        RangePartitioningRequired(("user",), "range-scheme"),
+        CompletePartitionBundles(),
+    )
+    assert spec.output_properties == _range_properties()
+    obligation = RowsOwnedByRange("user", "range-scheme")
+    assert spec.transforms[0].creates_obligations == (obligation,)
+    assert spec.transforms[1].discharges_obligations == (obligation,)
+    assert spec.native_input_payload is PayloadKind.RANGE_DATA
+    assert spec.native_output_payload is PayloadKind.RANGE_DATA
+    assert not spec.requires_complete_fusion
+    assert spec.fusion_group_id is None
+    assert not spec.uses_terminal_output_adapter
+
+
+def test_mgp_spec_consumes_complete_colocated_ranges_and_advertises_no_output_fact():
+    mapped = _map(_read())
+    grouped = _mgp(mapped)
+    lowered = GPUMapGroupPartitionsLowerer().lower(
+        grouped,
+        _context(
+            logical_node_id="mgp-node",
+            input_properties=_range_properties(),
+            source_artifacts=_artifacts(),
+        ),
+    )
+
+    spec = lowered.spec
+    assert spec.transform_ids == (
+        "mgp-node/0/sort_partition",
+        "mgp-node/1/build_group_boundaries",
+        "mgp-node/2/map_group_partitions",
+    )
+    assert spec.input_requirements == (
+        KeysColocated(("user", "card")),
+        CompletePartitionBundles(),
+    )
+    assert spec.output_properties == ()
+    assert spec.native_input_payload is PayloadKind.RANGE_DATA
+    assert spec.native_output_payload is PayloadKind.RANGE_DATA
+    # The exact planner, not the lowerer, marks this occurrence as region egress.
+    assert not spec.uses_terminal_output_adapter
+
+
+def test_independent_lowerer_specs_form_the_optimizer_composition_contract():
+    artifacts = _artifacts()
+    read_spec = _read_spec()
+    mapped = GPUMapBatchesLowerer().lower(
+        _map(_read()),
+        _context(
+            logical_node_id="map-node",
+            input_properties=read_spec.output_properties,
             source_artifacts=artifacts,
         ),
     )
     grouped = GPUMapGroupPartitionsLowerer().lower(
-        _mgp(read, preserves=False),
+        _mgp(_map(_read())),
         mapped.downstream_context.for_operator(logical_node_id="mgp-node"),
     )
 
-    compiled = compile_gpu_region((mapped.spec, grouped.spec))
+    # This calls the pure composition primitive directly only to validate the
+    # contracts emitted by each lowerer.  Production planning leaves all three
+    # specs independent for the physical optimizer.
+    composed = compose_gpu_operator_specs(
+        compose_gpu_operator_specs(read_spec, mapped.spec),
+        grouped.spec,
+    )
+
+    assert composed.transform_ids == (
+        "read-node/0/read_parquet_range",
+        "map-node/0/map_batches",
+        "map-node/1/validate_range_ownership",
+        "mgp-node/0/sort_partition",
+        "mgp-node/1/build_group_boundaries",
+        "mgp-node/2/map_group_partitions",
+    )
+    assert composed.logical_provenance == ("read-node", "map-node", "mgp-node")
+    assert composed.output_properties == ()
+
+
+def test_map_spec_rejects_a_different_range_scheme_during_composition():
+    map_spec = GPUMapBatchesLowerer().lower(
+        _map(_read()),
+        _context(
+            logical_node_id="map-node",
+            input_properties=_range_properties(),
+            source_artifacts=_artifacts(),
+        ),
+    ).spec
+
+    with pytest.raises(GPUCompositionError) as captured:
+        compose_gpu_operator_specs(
+            _read_spec(scheme_id="different-scheme"),
+            map_spec,
+        )
+
     assert (
-        compiled.transform_ids == mapped.spec.transform_ids + grouped.spec.transform_ids
+        captured.value.reason
+        is GPUCompositionErrorReason.INPUT_REQUIREMENTS_UNSATISFIED
     )
-    assert compiled.output_properties == grouped.spec.output_properties
-    assert isinstance(compiled.output_properties[0].value, UnknownPartitioning)
-
-
-def test_registered_partitioning_type_is_readvertised_without_lowerer_changes():
-    read = _read()
-    mapped_op = _map(read, preserves=True)
-    grouped_op = _mgp(mapped_op, preserves=True)
-    artifacts = _artifacts()
-    input_properties = (
-        PropertyFact(
-            _HashPartitioning(("user",), "hash-scheme"),
-            Evidence.OPERATOR_GUARANTEE,
-        ),
-        PropertyFact(
-            CompletePartitionBundles(),
-            Evidence.OPERATOR_GUARANTEE,
-        ),
-    )
-    transfers = create_default_property_transfer_registry()
-
-    register_partitioning_preservation(
-        _HashPartitioning,
-        _hash_partitioning_validations,
-    )
-    register_property_satisfaction(
-        _HashPartitioning,
-        KeysColocated,
-        _hash_satisfies_colocation,
-    )
-    try:
-        input_state = GPUPropertyState(input_properties, partition_count=2)
-        analyzed_map = transfers.transfer(mapped_op, input_state)
-        lowered_map = GPUMapBatchesLowerer().lower(
-            mapped_op,
-            _context(
-                logical_node_id="map-hash",
-                input_properties=input_properties,
-                source_artifacts=artifacts,
-            ),
-        )
-        assert lowered_map.spec.output_properties == analyzed_map.facts
-        assert isinstance(
-            lowered_map.spec.output_properties[0].value,
-            _HashPartitioning,
-        )
-        assert lowered_map.spec.transform_ids[-1] == (
-            "map-hash/1/validate_hash_ownership"
-        )
-
-        analyzed_grouped = transfers.transfer(grouped_op, analyzed_map)
-        lowered_grouped = GPUMapGroupPartitionsLowerer().lower(
-            grouped_op,
-            lowered_map.downstream_context.for_operator(
-                logical_node_id="mgp-hash",
-            ),
-        )
-        assert lowered_grouped.spec.output_properties == analyzed_grouped.facts
-        assert isinstance(
-            lowered_grouped.spec.output_properties[0].value,
-            _HashPartitioning,
-        )
-        assert lowered_grouped.spec.transform_ids[-1] == (
-            "mgp-hash/3/validate_hash_ownership"
-        )
-
-        repeated_grouped_op = _mgp(grouped_op, preserves=True)
-        analyzed_repeated = transfers.transfer(
-            repeated_grouped_op,
-            analyzed_grouped,
-        )
-        lowered_repeated = GPUMapGroupPartitionsLowerer().lower(
-            repeated_grouped_op,
-            lowered_grouped.downstream_context.for_operator(
-                logical_node_id="mgp-hash-repeated",
-            ),
-        )
-        compiled = compile_gpu_region(
-            (lowered_map.spec, lowered_grouped.spec, lowered_repeated.spec)
-        )
-        assert compiled.output_properties == analyzed_repeated.facts
-        assert isinstance(compiled.output_properties[0].value, _HashPartitioning)
-        assert compiled.transform_ids[-1] == (
-            "mgp-hash-repeated/3/validate_hash_ownership"
-        )
-    finally:
-        unregister_property_satisfaction(
-            _HashPartitioning,
-            KeysColocated,
-            expected=_hash_satisfies_colocation,
-        )
-        unregister_partitioning_preservation(
-            _HashPartitioning,
-            expected=_hash_partitioning_validations,
-        )

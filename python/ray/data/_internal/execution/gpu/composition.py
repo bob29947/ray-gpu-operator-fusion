@@ -17,12 +17,12 @@ from ray.data._internal.execution.gpu.properties import (
 
 class GPUCompositionErrorReason(str, Enum):
     EXECUTION_INCOMPATIBLE = "EXECUTION_INCOMPATIBLE"
+    FUSION_GROUP_INCOMPATIBLE = "FUSION_GROUP_INCOMPATIBLE"
     INPUT_REQUIREMENTS_UNSATISFIED = "INPUT_REQUIREMENTS_UNSATISFIED"
     PAYLOAD_INCOMPATIBLE = "PAYLOAD_INCOMPATIBLE"
     ADAPTER_INCOMPATIBLE = "ADAPTER_INCOMPATIBLE"
     UNRESOLVED_VALIDATION_OBLIGATION = "UNRESOLVED_VALIDATION_OBLIGATION"
     DUPLICATE_TRANSFORM_ID = "DUPLICATE_TRANSFORM_ID"
-    SEALED_GATE2_STAGE = "SEALED_GATE2_STAGE"
 
 
 class GPUCompositionError(ValueError):
@@ -68,12 +68,6 @@ def compose_gpu_operator_specs(
 ) -> GPUOperatorSpec:
     """Compose two adjacent specifications without consulting Ray runtime state."""
 
-    if upstream.gate2_composed or downstream.gate2_composed:
-        raise GPUCompositionError(
-            GPUCompositionErrorReason.SEALED_GATE2_STAGE,
-            "a gate-2-composed stage is atomic and cannot be re-composed",
-        )
-
     if (
         upstream.execution_requirements.backend_name
         != downstream.execution_requirements.backend_name
@@ -82,6 +76,26 @@ def compose_gpu_operator_specs(
         raise GPUCompositionError(
             GPUCompositionErrorReason.EXECUTION_INCOMPATIBLE,
             "GPU execution or retry compatibility keys differ",
+        )
+
+    if upstream.fusion_group_id != downstream.fusion_group_id:
+        raise GPUCompositionError(
+            GPUCompositionErrorReason.FUSION_GROUP_INCOMPATIBLE,
+            "GPU fusion group identifiers differ: "
+            f"{upstream.fusion_group_id!r} != {downstream.fusion_group_id!r}",
+        )
+    if upstream.requires_complete_fusion != downstream.requires_complete_fusion:
+        raise GPUCompositionError(
+            GPUCompositionErrorReason.FUSION_GROUP_INCOMPATIBLE,
+            "required-fusion declarations differ across one fusion group",
+        )
+    if (
+        upstream.required_logical_provenance
+        != downstream.required_logical_provenance
+    ):
+        raise GPUCompositionError(
+            GPUCompositionErrorReason.FUSION_GROUP_INCOMPATIBLE,
+            "required logical provenance differs across one fusion group",
         )
 
     if upstream.native_output_payload != downstream.native_input_payload:
@@ -102,6 +116,11 @@ def compose_gpu_operator_specs(
             f"{upstream.output_adapter_key!r} -> "
             f"{downstream.external_input_payload.value}/"
             f"{downstream.input_adapter_key!r}",
+        )
+    if upstream.uses_terminal_output_adapter:
+        raise GPUCompositionError(
+            GPUCompositionErrorReason.ADAPTER_INCOMPATIBLE,
+            "a terminal GPU egress cannot feed another planned GPU operator",
         )
 
     if not requirements_satisfied(
@@ -139,8 +158,8 @@ def compose_gpu_operator_specs(
         native_output_payload=downstream.native_output_payload,
         input_adapter_key=upstream.input_adapter_key,
         # Composition compatibility is intentionally based on the preserving
-        # boundary declaration.  Terminal materialization is selected only
-        # when gate 2 seals the final component stage.
+        # boundary declaration. Terminal materialization is selected only for
+        # the final node in a required physical-fusion group.
         output_adapter_key=downstream.output_adapter_key,
         terminal_output_adapter_key=downstream.terminal_output_adapter_key,
         execution_requirements=upstream.execution_requirements,
@@ -151,5 +170,10 @@ def compose_gpu_operator_specs(
         logical_provenance=(
             upstream.logical_provenance + downstream.logical_provenance
         ),
+        fusion_group_id=upstream.fusion_group_id,
+        requires_complete_fusion=upstream.requires_complete_fusion,
+        required_logical_provenance=upstream.required_logical_provenance,
+        # Input parallelism belongs to the composed region's external input.
+        owns_input_parallelism=upstream.owns_input_parallelism,
         uses_terminal_output_adapter=downstream.uses_terminal_output_adapter,
     )

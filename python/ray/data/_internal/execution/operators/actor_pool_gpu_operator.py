@@ -150,6 +150,14 @@ class ActorPoolGPUOperatorFactory(GPUOperatorFactory):
         return (
             spec.execution_requirements.backend_name == "actor_pool"
             and spec.compatibility_key.worker_lifecycle == "actor_pool"
+            and (
+                not spec.requires_complete_fusion
+                or (
+                    spec.logical_provenance
+                    == spec.required_logical_provenance
+                    and spec.uses_terminal_output_adapter
+                )
+            )
             and all(
                 supports_gpu_transform_runtime(transform)
                 for transform in spec.transforms

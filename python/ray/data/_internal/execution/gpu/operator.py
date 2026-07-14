@@ -7,10 +7,14 @@ from dataclasses import dataclass, replace
 from typing import Dict, Optional, Protocol, TYPE_CHECKING
 
 from ray.data._internal.execution.gpu.operator_spec import GPUOperatorSpec
+from ray.data._internal.execution.interfaces import PhysicalOperator
 
 if TYPE_CHECKING:
-    from ray.data._internal.execution.interfaces import PhysicalOperator
     from ray.data.context import DataContext
+
+
+class GPURequiredFusionError(ValueError):
+    """A deferred GPU region could not be materialized as one physical stage."""
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,57 @@ class GPUOperator(ABC):
         pass
 
 
+class PlannedGPUOperator(PhysicalOperator, GPUOperator):
+    """Backend-neutral, non-executable physical node awaiting required fusion."""
+
+    def __init__(
+        self,
+        spec: GPUOperatorSpec,
+        input_op: PhysicalOperator,
+        data_context: "DataContext",
+        creation_options: Optional[GPUOperatorCreationOptions] = None,
+    ) -> None:
+        if not spec.requires_complete_fusion or not spec.fusion_group_id:
+            raise ValueError(
+                "PlannedGPUOperator requires a complete-fusion specification"
+            )
+        self._gpu_operator_spec = spec
+        self._gpu_creation_options = (
+            creation_options or GPUOperatorCreationOptions()
+        )
+        name = self._gpu_creation_options.name or (
+            "PlannedGPU["
+            + ",".join(transform.kind for transform in spec.transforms)
+            + "]"
+        )
+        super().__init__(
+            name,
+            [input_op],
+            data_context,
+            target_max_block_size_override=(
+                self._gpu_creation_options.target_max_block_size_override
+            ),
+        )
+
+    @property
+    def gpu_operator_spec(self) -> GPUOperatorSpec:
+        return self._gpu_operator_spec
+
+    @property
+    def execution_backend_name(self) -> str:
+        return self._gpu_operator_spec.execution_requirements.backend_name
+
+    @property
+    def gpu_creation_options(self) -> GPUOperatorCreationOptions:
+        return self._gpu_creation_options
+
+    def start(self, *_args, **_kwargs) -> None:
+        raise GPURequiredFusionError(
+            "a PlannedGPUOperator reached execution before required physical fusion: "
+            f"group={self._gpu_operator_spec.fusion_group_id!r}"
+        )
+
+
 class GPUOperatorFactory(Protocol):
     def supports(self, spec: GPUOperatorSpec) -> bool: ...
 
@@ -105,6 +160,14 @@ def create_gpu_operator(
     data_context: "DataContext",
     creation_options: Optional[GPUOperatorCreationOptions] = None,
 ) -> "PhysicalOperator":
+    if spec.requires_complete_fusion and (
+        spec.logical_provenance != spec.required_logical_provenance
+        or not spec.uses_terminal_output_adapter
+    ):
+        raise ValueError(
+            "a required-fusion GPU specification may be materialized only after "
+            "its complete logical provenance and terminal egress are present"
+        )
     backend_name = spec.execution_requirements.backend_name
     _ensure_default_factory_loaded(backend_name)
     try:

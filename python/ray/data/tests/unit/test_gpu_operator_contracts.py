@@ -20,13 +20,12 @@ from ray.data._internal.execution.gpu import (
     PartitionIdentity,
     PayloadKind,
     PropertyFact,
-    PropertyRequirement,
-    PropertyValue,
     RANGE_DATA_BOUNDARY_ADAPTER_KEY,
     RANGE_DATA_TERMINAL_ADAPTER_KEY,
     RANGE_WORK_ADAPTER_KEY,
     RangeData,
     RangePartitioning,
+    RangePartitioningRequired,
     RangePartitionIdentity,
     RowsOwnedByRange,
     UnknownPartitioning,
@@ -35,7 +34,6 @@ from ray.data._internal.execution.gpu import (
     get_gpu_boundary_adapter,
     property_satisfies,
     register_gpu_boundary_adapter,
-    register_property_satisfaction,
     unregister_gpu_boundary_adapter,
 )
 from ray.data._internal.execution.gpu.runtime import (
@@ -67,6 +65,12 @@ def _spec(
     discharges=(),
     requires_resolved=False,
     config=None,
+    provenance=None,
+    fusion_group_id=None,
+    requires_complete_fusion=False,
+    required_provenance=(),
+    owns_input_parallelism=False,
+    uses_terminal_output_adapter=False,
 ):
     if key is None:
         key = GPUExecutionCompatibilityKey(num_gpus=0)
@@ -94,7 +98,12 @@ def _spec(
         execution_requirements=GPUExecutionRequirements(compatibility_key=key),
         input_requirements=requirements,
         output_properties=properties,
-        logical_provenance=(transform_id,),
+        logical_provenance=(transform_id,) if provenance is None else provenance,
+        fusion_group_id=fusion_group_id,
+        requires_complete_fusion=requires_complete_fusion,
+        required_logical_provenance=required_provenance,
+        owns_input_parallelism=owns_input_parallelism,
+        uses_terminal_output_adapter=uses_terminal_output_adapter,
     )
 
 
@@ -237,19 +246,41 @@ def test_compose_is_pairwise_pure_associative_and_serializable():
         ),
         (
             _spec(
-                "sealed",
+                "required-a",
                 PayloadKind.CUDF_BATCH_STREAM,
                 PayloadKind.CUDF_BATCH_STREAM,
-            ).for_gate2_stage(
-                specialized_read_parallelism_resolved=True,
-                uses_terminal_output_adapter=True,
+                fusion_group_id="group-a",
+                requires_complete_fusion=True,
+                required_provenance=("required-a", "required-b"),
             ),
             _spec(
-                "adjacent",
+                "required-b",
                 PayloadKind.CUDF_BATCH_STREAM,
                 PayloadKind.CUDF_BATCH_STREAM,
+                fusion_group_id="group-b",
+                requires_complete_fusion=True,
+                required_provenance=("required-a", "required-b"),
             ),
-            GPUCompositionErrorReason.SEALED_GATE2_STAGE,
+            GPUCompositionErrorReason.FUSION_GROUP_INCOMPATIBLE,
+        ),
+        (
+            _spec(
+                "required-a",
+                PayloadKind.CUDF_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
+                fusion_group_id="group",
+                requires_complete_fusion=True,
+                required_provenance=("required-a", "required-b"),
+            ),
+            _spec(
+                "required-b",
+                PayloadKind.CUDF_BATCH_STREAM,
+                PayloadKind.CUDF_BATCH_STREAM,
+                fusion_group_id="group",
+                requires_complete_fusion=True,
+                required_provenance=("required-a", "different"),
+            ),
+            GPUCompositionErrorReason.FUSION_GROUP_INCOMPATIBLE,
         ),
     ],
 )
@@ -257,6 +288,26 @@ def test_compose_stable_error_codes(upstream, downstream, reason):
     with pytest.raises(GPUCompositionError) as exc_info:
         compose_gpu_operator_specs(upstream, downstream)
     assert exc_info.value.reason is reason
+
+
+def test_terminal_egress_cannot_be_composed_as_an_upstream_boundary():
+    terminal = _spec(
+        "terminal",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+        uses_terminal_output_adapter=True,
+    )
+    adjacent = _spec(
+        "adjacent",
+        PayloadKind.CUDF_BATCH_STREAM,
+        PayloadKind.CUDF_BATCH_STREAM,
+    )
+
+    with pytest.raises(GPUCompositionError) as captured:
+        compose_gpu_operator_specs(terminal, adjacent)
+
+    assert captured.value.reason is GPUCompositionErrorReason.ADAPTER_INCOMPATIBLE
+    assert "terminal GPU egress" in str(captured.value)
 
 
 def test_retry_policy_is_canonical_and_part_of_execution_compatibility():
@@ -300,7 +351,7 @@ def test_retry_policy_is_canonical_and_part_of_execution_compatibility():
     ) != GPUExecutionCompatibilityKey(num_gpus=0, retry_policy=disabled_canonical)
 
 
-def test_range_and_complete_partition_facts_satisfy_independent_requirements():
+def test_range_and_complete_partition_facts_satisfy_exact_requirements():
     range_fact = PropertyFact(
         RangePartitioning(("User",), "scheme"), Evidence.USER_ASSERTED
     )
@@ -310,31 +361,23 @@ def test_range_and_complete_partition_facts_satisfy_independent_requirements():
 
     assert property_satisfies(range_fact, KeysColocated(("User", "Card")))
     assert not property_satisfies(range_fact, KeysColocated(("Card", "User")))
+    assert property_satisfies(
+        range_fact,
+        RangePartitioningRequired(("User",), "scheme"),
+    )
+    assert not property_satisfies(
+        range_fact,
+        RangePartitioningRequired(("Card",), "scheme"),
+    )
+    assert not property_satisfies(
+        range_fact,
+        RangePartitioningRequired(("User",), "different-scheme"),
+    )
     assert property_satisfies(complete_fact, CompletePartitionBundles())
     assert not property_satisfies(
         PropertyFact(UnknownPartitioning(), Evidence.DERIVED),
         KeysColocated(("User",)),
     )
-
-
-def test_property_dispatch_extends_without_resolver_changes():
-    @dataclass(frozen=True)
-    class _HashPartitioning(PropertyValue):
-        keys: tuple[str, ...]
-
-    @dataclass(frozen=True)
-    class _HashColocated(PropertyRequirement):
-        keys: tuple[str, ...]
-
-    register_property_satisfaction(
-        _HashPartitioning,
-        _HashColocated,
-        lambda fact, requirement: fact.keys == requirement.keys,
-    )
-    fact = PropertyFact(_HashPartitioning(("id",)), Evidence.DERIVED)
-
-    assert property_satisfies(fact, _HashColocated(("id",)))
-    assert not property_satisfies(fact, _HashColocated(("other",)))
 
 
 def test_composition_uses_only_explicit_downstream_readvertisement():
@@ -419,23 +462,86 @@ def test_partial_region_probe_allows_a_later_spec_to_discharge_obligation():
     )
 
 
-def test_gate2_marker_is_explicit_and_cannot_be_forged_halfway():
-    spec = _spec(
+def test_required_fusion_group_and_provenance_propagate_through_composition():
+    range_fact = PropertyFact(
+        RangePartitioning(("User",), "scheme"), Evidence.OPERATOR_GUARANTEE
+    )
+    complete_fact = PropertyFact(
+        CompletePartitionBundles(), Evidence.OPERATOR_GUARANTEE
+    )
+    required_provenance = ("read", "map", "mgp")
+    common = {
+        "fusion_group_id": "required-v1-region",
+        "requires_complete_fusion": True,
+        "required_provenance": required_provenance,
+    }
+    read = _spec(
+        "read",
+        PayloadKind.RANGE_WORK,
+        PayloadKind.RANGE_DATA,
+        input_adapter=RANGE_WORK_ADAPTER_KEY,
+        properties=(range_fact, complete_fact),
+        owns_input_parallelism=True,
+        **common,
+    )
+    mapped = _spec(
+        "map",
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+        properties=(range_fact, complete_fact),
+        **common,
+    )
+    grouped = _spec(
+        "mgp",
+        PayloadKind.RANGE_DATA,
+        PayloadKind.RANGE_DATA,
+        requirements=(
+            KeysColocated(("User", "Card")),
+            CompletePartitionBundles(),
+        ),
+        uses_terminal_output_adapter=True,
+        **common,
+    )
+
+    assert read.logical_provenance != read.required_logical_provenance
+    stage = compile_gpu_region((read, mapped, grouped))
+
+    assert stage.fusion_group_id == "required-v1-region"
+    assert stage.requires_complete_fusion
+    assert stage.required_logical_provenance == required_provenance
+    assert stage.logical_provenance == required_provenance
+    assert stage.owns_input_parallelism
+    assert stage.uses_terminal_output_adapter
+    assert stage.active_output_adapter_key == RANGE_DATA_TERMINAL_ADAPTER_KEY
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"requires_complete_fusion": True}, "requires a fusion_group_id"),
+        (
+            {
+                "fusion_group_id": "required-v1-region",
+                "requires_complete_fusion": True,
+            },
+            "requires logical provenance",
+        ),
+        (
+            {"required_logical_provenance": ("read",)},
+            "requires a fusion_group_id",
+        ),
+    ],
+)
+def test_incomplete_required_spec_declaration_is_rejected(changes, message):
+    base = _spec(
         "read",
         PayloadKind.RANGE_WORK,
         PayloadKind.RANGE_DATA,
         input_adapter=RANGE_WORK_ADAPTER_KEY,
     )
-    sealed = spec.for_gate2_stage(
-        specialized_read_parallelism_resolved=True,
-        uses_terminal_output_adapter=True,
-    )
 
-    assert sealed.gate2_composed
-    assert sealed.specialized_read_parallelism_resolved
-    assert not spec.gate2_composed
-    with pytest.raises(ValueError, match="only on a gate-2-composed stage"):
-        replace(spec, specialized_read_parallelism_resolved=True)
+    with pytest.raises(ValueError, match=message):
+        replace(base, **changes)
 
 
 def test_v1_boundary_registry_exposes_only_implemented_directions():

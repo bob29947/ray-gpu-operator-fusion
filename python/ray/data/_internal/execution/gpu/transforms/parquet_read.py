@@ -145,6 +145,8 @@ class ReadParquetRangeRuntime:
                     )
 
                 def read_chunk() -> tuple[Any]:
+                    if self._config.source_kind == "s3":
+                        self._context.refresh_s3_for_task()
                     self._verify_identity(file)
                     frame = cudf.read_parquet(path, **kwargs)
                     self._verify_identity(file)
@@ -174,6 +176,4 @@ class ReadParquetRangeRuntime:
         if not isinstance(value, ParquetRangeWork):
             raise TypeError("read_parquet_range expected native ParquetRangeWork")
         work = value
-        if self._config.source_kind == "s3":
-            self._context.refresh_s3_for_task()
         return RangeData(work.partition, self._read_frames(work))

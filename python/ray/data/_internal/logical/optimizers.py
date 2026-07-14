@@ -77,6 +77,33 @@ class PhysicalOptimizer(Optimizer):
     def rules(self) -> List[Rule]:
         return [rule_cls() for rule_cls in get_physical_ruleset()]
 
+    def _post_optimize(self, plan: PhysicalPlan) -> PhysicalPlan:
+        # Planned GPU nodes are deliberately non-executable.  Keep this check
+        # outside the fusion rule so a custom physical ruleset cannot silently
+        # omit required materialization and hand deferred nodes to the executor.
+        from ray.data._internal.execution.gpu.operator import (
+            GPURequiredFusionError,
+            PlannedGPUOperator,
+        )
+
+        leftovers = tuple(
+            op
+            for op in plan.dag.post_order_iter()
+            if isinstance(op, PlannedGPUOperator)
+        )
+        if leftovers:
+            groups = sorted(
+                {
+                    op.gpu_operator_spec.fusion_group_id or "<missing>"
+                    for op in leftovers
+                }
+            )
+            raise GPURequiredFusionError(
+                "physical optimization left non-executable planned GPU "
+                f"operators: groups={groups!r}"
+            )
+        return plan
+
 
 def get_execution_plan(
     logical_plan: LogicalPlan,

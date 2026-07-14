@@ -1,5 +1,7 @@
 import pickle
 
+import pytest
+
 from ray.data._internal.execution.gpu.parquet_types import (
     ParquetFileWork,
     ParquetFooterSummary,
@@ -16,6 +18,9 @@ from ray.data._internal.execution.gpu.transforms.boundary import (
 from ray.data._internal.execution.gpu.transforms.map_batches import (
     MapBatchesConfig,
     MapBatchesRuntime,
+)
+from ray.data._internal.execution.gpu.transforms._runtime_support import (
+    CudfRuntimeContext,
 )
 from ray.data._internal.execution.gpu.transforms.parquet_read import (
     ReadParquetRangeConfig,
@@ -190,6 +195,10 @@ class _RetryingCudf:
             raise error
         return pd.DataFrame({"user": [2], "value": [10]})
 
+    def get_option(self, name):
+        assert name == "kvikio_remote_io"
+        return True
+
 
 class _ReadContext:
     def __init__(self, cudf):
@@ -198,6 +207,19 @@ class _ReadContext:
     def ensure_cudf(self, **kwargs):
         del kwargs
         return self
+
+
+class _RefreshingReadContext(_ReadContext):
+    def __init__(self, cudf, refresh_failures):
+        super().__init__(cudf)
+        self._refresh_failures = iter(refresh_failures)
+        self.refresh_calls = 0
+
+    def refresh_s3_for_task(self):
+        self.refresh_calls += 1
+        error = next(self._refresh_failures, None)
+        if error is not None:
+            raise error
 
 
 def _read_runtime(cudf, retried_io_errors):
@@ -248,8 +270,187 @@ def test_parquet_row_group_read_does_not_retry_unmatched_error(monkeypatch):
     cudf = _RetryingCudf([OSError("permanent failure")])
     output = _read_runtime(cudf, ("temporary network",)).apply(_read_work(), None)
 
-    import pytest
-
     with pytest.raises(OSError, match="permanent failure"):
         list(output.value)
     assert cudf.calls == 1
+
+
+def test_s3_refresh_is_part_of_each_retried_read_attempt(monkeypatch):
+    from ray.data._internal import util
+
+    monkeypatch.setattr(util.time, "sleep", lambda _seconds: None)
+    cudf = _RetryingCudf([])
+    context = _RefreshingReadContext(
+        cudf, [OSError("temporary credential refresh failure")]
+    )
+    runtime = ReadParquetRangeRuntime(
+        ReadParquetRangeConfig(
+            source_kind="s3",
+            region="us-east-1",
+            projection=("user", "value"),
+            range_key="user",
+            retried_io_errors=("temporary credential refresh",),
+        ),
+        context,
+    )
+    runtime._verify_identity = lambda _file: None
+
+    output = runtime.apply(_read_work(), None)
+
+    assert [frame.to_dict("records") for frame in output.value] == [
+        [{"user": 2, "value": 10}]
+    ]
+    assert context.refresh_calls == 2
+    assert cudf.calls == 1
+
+
+class _FakeClient:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeSession:
+    def __init__(self, outcomes):
+        self._outcomes = iter(outcomes)
+
+    def create_client(self, service, *, region_name):
+        assert service == "s3"
+        assert region_name == "us-east-1"
+        outcome = next(self._outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _FakeCudfOptions:
+    def __init__(self):
+        self.remote_io = False
+
+    def set_option(self, name, value):
+        assert name == "kvikio_remote_io"
+        self.remote_io = value
+
+    def get_option(self, name):
+        assert name == "kvikio_remote_io"
+        return self.remote_io
+
+
+def test_s3_initialization_commits_only_after_complete_success(monkeypatch):
+    from ray.data._internal.execution.gpu.transforms import _runtime_support
+
+    first_client = _FakeClient()
+    second_client = _FakeClient()
+    fake_session = _FakeSession([first_client, second_client])
+    credentials = object()
+    attempts = 0
+
+    monkeypatch.setattr(
+        _runtime_support,
+        "refresh_aws_credentials",
+        lambda region: (fake_session, credentials),
+    )
+
+    def configure(region, configured_session, configured_credentials):
+        nonlocal attempts
+        assert region == "us-east-1"
+        assert configured_session is fake_session
+        assert configured_credentials is credentials
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary KvikIO configuration failure")
+
+    monkeypatch.setattr(_runtime_support, "configure_kvikio", configure)
+    context = CudfRuntimeContext()
+    context.cudf = _FakeCudfOptions()
+
+    with pytest.raises(OSError, match="temporary KvikIO"):
+        context._ensure_s3("us-east-1")
+
+    assert first_client.closed
+    assert context._aws_session is None
+    assert context._aws_credentials is None
+    assert context._s3_client is None
+    assert context._source_kind is None
+    assert context._region is None
+
+    context._ensure_s3("us-east-1")
+
+    assert context._aws_session is fake_session
+    assert context._aws_credentials is credentials
+    assert context.s3_client is second_client
+    assert context._source_kind == "s3"
+    assert context._region == "us-east-1"
+
+
+def test_s3_client_refresh_keeps_previous_client_until_replacement_exists(
+    monkeypatch,
+):
+    from ray.data._internal.execution.gpu.transforms import _runtime_support
+
+    previous_client = _FakeClient()
+    replacement_client = _FakeClient()
+    session = _FakeSession(
+        [OSError("temporary client creation failure"), replacement_client]
+    )
+    credentials = object()
+    monkeypatch.setattr(
+        _runtime_support,
+        "refresh_aws_credentials",
+        lambda region, configured_session, configured_credentials: (
+            configured_session,
+            configured_credentials,
+        ),
+    )
+    context = CudfRuntimeContext()
+    context._source_kind = "s3"
+    context._region = "us-east-1"
+    context._aws_session = session
+    context._aws_credentials = credentials
+    context._s3_client = previous_client
+
+    with pytest.raises(OSError, match="temporary client creation"):
+        context.refresh_s3_for_task()
+
+    assert context.s3_client is previous_client
+    assert not previous_client.closed
+
+    context.refresh_s3_for_task()
+
+    assert context.s3_client is replacement_client
+    assert previous_client.closed
+
+
+def test_driver_footer_planning_honors_retried_io_errors(monkeypatch):
+    from ray.data._internal import util
+    from ray.data._internal.planner import parquet_cudf_range_planner as planner
+
+    monkeypatch.setattr(util.time, "sleep", lambda _seconds: None)
+    footer = ParquetFooterSummary(
+        (ParquetRowGroup("a", _identity(), 0, 1, 0, 0, 1, 1),),
+        footer_bytes=1,
+        elapsed_s=0.1,
+    )
+    attempts = 0
+
+    def read_footer(_read, _range_key):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary footer network failure")
+        return footer
+
+    monkeypatch.setattr(planner, "read_footer_summary", read_footer)
+
+    plan = planner.plan_parquet_ranges(
+        object(),
+        range_key="user",
+        target_ranges=1,
+        num_workers=1,
+        retried_io_errors=("temporary footer network",),
+    )
+
+    assert len(plan.work) == 1
+    assert attempts == 2
