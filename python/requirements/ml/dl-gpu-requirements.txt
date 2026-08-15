@@ -16,7 +16,7 @@ torch-cluster==1.6.3+pt27cu128
 torch-spline-conv==1.2.2+pt27cu128
 
 cupy-cuda12x>=13.4.0; sys_platform != 'darwin'
-cudf-cu12>=24.12.0; sys_platform != 'darwin'
+cudf-cu12>=26.8.0; sys_platform != 'darwin'
 nixl==1.2.0; sys_platform != 'darwin'
 
 jax==0.4.33; python_version < '3.12' and sys_platform != 'darwin'
