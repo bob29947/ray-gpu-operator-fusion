@@ -48,4 +48,4 @@ numexpr
 onnx>=1.17.0; sys_platform != 'darwin' or platform_machine != 'arm64'
 onnxruntime==1.20.0; (sys_platform != 'darwin' or platform_machine != 'arm64') and python_version == '3.10'
 onnxruntime==1.24.4; (sys_platform != 'darwin' or platform_machine != 'arm64') and python_version > '3.10'
-onnxscript>=0.6.2; sys_platform != 'darwin' or platform_machine != 'arm64'
+onnxscript>=0.7.1; sys_platform != 'darwin' or platform_machine != 'arm64'
