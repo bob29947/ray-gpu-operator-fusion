@@ -15,7 +15,7 @@ webdataset
 raydp==1.7.0b20250423.dev0
 pylance
 delta-sharing
-deltalake==1.5.0
+deltalake==1.6.2
 pytest-mock
 decord
 snowflake-connector-python>=3.15.0
